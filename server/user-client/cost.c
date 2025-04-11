@@ -8,8 +8,7 @@
 #include <sys/time.h>
 
 #include "common.h"
-#include "sm2.h"
-#include "sm3.h"
+#include "gm_crypto.h"
 #include "tools.h"
 #include "imp_cert.h"
 

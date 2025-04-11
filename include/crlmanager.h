@@ -3,9 +3,9 @@
 
 #include <stdint.h>
 
-// 基础CRL节点结构
+// CRL节点结构
 typedef struct {
-    unsigned char hash[32];
+    unsigned char* hash;  // 改为指针，可以动态分配和释放
     int is_valid;
 } CRLNode;
 

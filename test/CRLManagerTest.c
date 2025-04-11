@@ -1,170 +1,182 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
+#include <sys/stat.h>
 #include "../include/crlmanager.h"
 
-// 用于生成随机哈希的辅助函数
-void generate_random_hash(unsigned char* hash) {
-    for (int i = 0; i < 32; i++) {
-        hash[i] = rand() % 256;
+// 辅助函数：获取文件大小
+long get_file_size(const char* filename) {
+    struct stat st;
+    if (stat(filename, &st) == 0) {
+        return st.st_size;
     }
+    return -1;
 }
 
-// 用于打印哈希值的辅助函数
-void print_hash(const unsigned char* hash) {
-    for (int i = 0; i < 8; i++) { // 仅打印前8字节作为示例
-        printf("%02x", hash[i]);
-    }
-}
-
-// 打印更新包内容
-void print_update(const UpdatedCRL* update) {
-    printf("更新包内容:\n");
-    printf("新增节点数量: %d\n", update->added_count);
-    if (update->added_count > 0) {
-        printf("新增节点版本范围: %d 到 %d\n", 
-               update->added->begin_v, 
-               update->added->end_v - 1);
-        printf("新增节点详情:\n");
-        for (int i = 0; i < update->added_count; i++) {
-            printf("版本 %d: 哈希=", update->added->begin_v + i);
-            print_hash(update->added->nodes[i].hash);
-            printf(", 有效=%d\n", update->added->nodes[i].is_valid);
-        }
+// 辅助函数：打印UpdatedCRL内容
+void print_updated_crl(const UpdatedCRL* updated_crl) {
+    if (!updated_crl) {
+        printf("更新包为空\n");
+        return;
     }
     
-    printf("删除节点数量: %d\n", update->del_count);
-    if (update->del_count > 0) {
-        printf("删除的版本号: ");
-        for (int i = 0; i < update->del_count; i++) {
-            printf("%d ", update->del_crl->del_versions[i]);
+    printf("--------------------------------\n");
+    printf("更新包内容：\n");
+    printf("新增节点数量: %d, 删除节点数量: %d\n", updated_crl->added_count, updated_crl->del_count);
+    
+    if (updated_crl->added) {
+        AddedCRL* added = updated_crl->added;
+        printf("base_v变动: (%d->%d)\n", added->begin_v, added->end_v);
+        printf("新增节点状态: ");
+        for (int i = 0; i < updated_crl->added_count; i++) {
+            printf("%d ", added->nodes[i].is_valid);
         }
         printf("\n");
+    }
+    
+    if (updated_crl->del_crl) {
+        DelCRL* del_crl = updated_crl->del_crl;
+        printf("removed_v变动: (%d->%d)\n", del_crl->begin_v, del_crl->end_v);
+        printf("删除节点版本: ");
+        for (int i = 0; i < updated_crl->del_count; i++) {
+            printf("%d ", del_crl->del_versions[i]);
+        }
+        printf("\n");
+    }
+    printf("--------------------------------\n");
+}
+
+// 辅助函数：保存用户CRL并打印文件大小
+void save_and_print_user_crl(CRLManager* manager, const char* filename) {
+    // 保存到文件
+    if (CRLManager_save_to_file(manager, filename) != 0) {
+        printf("保存CRL到文件失败: %s\n", filename);
+        return;
+    }
+    
+    // 获取并打印文件大小
+    long file_size = get_file_size(filename);
+    if (file_size >= 0) {
+        printf("CRL文件大小: %ld 字节\n", file_size);
+    } else {
+        printf("获取文件大小失败: %s\n", filename);
+    }
+}
+
+// 生成一个示例哈希值
+void generate_hash(unsigned char* hash, int seed) {
+    for (int i = 0; i < 32; i++) {
+        hash[i] = (unsigned char)(i + seed) % 256;
     }
 }
 
 int main() {
-    srand((unsigned int)time(NULL));
-    
     // 初始化CA和用户的CRL管理器
     CRLManager* ca_manager = CRLManager_init(10, 10);
-    CRLManager* user_manager = CRLManager_init(10, 10);
+    CRLManager* user_manager = CRLManager_init(10, 0);
     
     if (!ca_manager || !user_manager) {
-        printf("初始化CRL管理器失败\n");
+        printf("初始化管理器失败\n");
         return -1;
     }
     
+    const char* user_crl_file = "user_crl.dat";
     unsigned char hash[32];
-    int buffer_size = 4096;
-    unsigned char* buffer = (unsigned char*)malloc(buffer_size);
-    if (!buffer) {
-        printf("内存分配失败\n");
-        CRLManager_free(ca_manager);
-        CRLManager_free(user_manager);
-        return -1;
-    }
     
-    printf("\n==== 步骤1: CA添加3个证书哈希，用户同步 ====\n");
-    
-    // CA添加3个证书哈希
+    printf("\n步骤1: CA加入3个证书哈希，用户同步\n");
+    // CA添加3个哈希
     for (int i = 0; i < 3; i++) {
-        generate_random_hash(hash);
+        generate_hash(hash, i);
         CRLManager_add_node(ca_manager, hash);
-        printf("CA添加证书 #%d: ", i);
-        print_hash(hash);
-        printf("\n");
     }
     
-    printf("\nCA状态: ");
+    printf("CA状态：\n");
     CRLManager_print(ca_manager);
     
-    // 用户同步
-    UpdatedCRL* update = CRLManager_generate_update(ca_manager, 0, 0);
-    int serialized_size = CRLManager_serialize_update(update, buffer, buffer_size);
+    // 用户同步初始状态
+    UpdatedCRL* update1 = CRLManager_generate_update(ca_manager, 0, 0);
+    printf("用户获取初始同步包：\n");
+    print_updated_crl(update1);
     
-    printf("\n用户从CA获取更新包（初始同步）\n");
-    UpdatedCRL* received_update = CRLManager_deserialize_update(buffer, serialized_size);
-    CRLManager_apply_update(user_manager, received_update);
-    
-    printf("用户状态: ");
+    // 应用更新
+    CRLManager_apply_update(user_manager, update1);
+    printf("用户同步后状态：\n");
     CRLManager_print(user_manager);
     
-    CRLManager_free_update(update);
-    CRLManager_free_update(received_update);
+    // 保存用户CRL并打印文件大小
+    save_and_print_user_crl(user_manager, user_crl_file);
     
-    printf("\n==== 步骤2: CA添加5个证书，删除索引5和7的证书，用户同步 ====\n");
+    // 释放更新包
+    CRLManager_free_update(update1);
     
-    // CA添加5个新证书
-    for (int i = 0; i < 5; i++) {
-        generate_random_hash(hash);
+    printf("\n步骤2: CA添加5个证书哈希，删除第5和第7个，用户同步\n");
+    // CA添加5个新哈希
+    for (int i = 3; i < 8; i++) {
+        generate_hash(hash, i);
         CRLManager_add_node(ca_manager, hash);
-        printf("CA添加证书 #%d: ", i + 3);
-        print_hash(hash);
-        printf("\n");
     }
     
-    // CA删除索引为5和7的证书
-    printf("CA删除索引为5的证书\n");
-    CRLManager_remove_node(ca_manager, 5);
-    printf("CA删除索引为7的证书\n");
-    CRLManager_remove_node(ca_manager, 7);
+    // CA删除第5个和第7个（索引4和6）
+    CRLManager_remove_node(ca_manager, 4);
+    CRLManager_remove_node(ca_manager, 6);
     
-    printf("\nCA状态: ");
+    printf("CA状态：\n");
     CRLManager_print(ca_manager);
     
-    // 用户同步（用户当前base_v=3, removed_v=0）
-    update = CRLManager_generate_update(ca_manager, 3, 0);
-    serialized_size = CRLManager_serialize_update(update, buffer, buffer_size);
+    // 用户发起同步请求
+    UpdatedCRL* update2 = CRLManager_generate_update(ca_manager, user_manager->base_v, user_manager->removed_v);
+    printf("用户获取第二次同步包：\n");
+    print_updated_crl(update2);
     
-    printf("\n用户从CA获取更新包\n");
-    received_update = CRLManager_deserialize_update(buffer, serialized_size);
-    
-    // 打印此次更新包内容
-    print_update(received_update);
-    
-    CRLManager_apply_update(user_manager, received_update);
-    
-    printf("\n用户同步后状态: ");
+    // 应用更新
+    CRLManager_apply_update(user_manager, update2);
+    printf("用户同步后状态：\n");
     CRLManager_print(user_manager);
     
-    CRLManager_free_update(update);
-    CRLManager_free_update(received_update);
+    // 保存用户CRL并打印文件大小
+    save_and_print_user_crl(user_manager, user_crl_file);
     
-    printf("\n==== 步骤3: CA删除索引2和3的证书，用户同步 ====\n");
+    // 释放更新包
+    CRLManager_free_update(update2);
     
-    // CA删除索引为2和3的证书
-    printf("CA删除索引为2的证书\n");
+    printf("\n步骤3: CA删除第2和第3个，用户同步\n");
+    // CA删除第2个和第3个（索引1和2）
+    CRLManager_remove_node(ca_manager, 1);
     CRLManager_remove_node(ca_manager, 2);
-    printf("CA删除索引为3的证书\n");
-    CRLManager_remove_node(ca_manager, 3);
     
-    printf("\nCA状态: ");
+    printf("CA状态：\n");
     CRLManager_print(ca_manager);
     
-    // 用户同步（用户当前base_v=8, removed_v=2）
-    update = CRLManager_generate_update(ca_manager, 8, 2);
-    serialized_size = CRLManager_serialize_update(update, buffer, buffer_size);
+    // 用户发起同步请求
+    UpdatedCRL* update3 = CRLManager_generate_update(ca_manager, user_manager->base_v, user_manager->removed_v);
+    printf("用户获取第三次同步包：\n");
+    print_updated_crl(update3);
     
-    printf("\n用户从CA获取更新包\n");
-    received_update = CRLManager_deserialize_update(buffer, serialized_size);
-    
-    // 打印此次更新包内容
-    print_update(received_update);
-    
-    CRLManager_apply_update(user_manager, received_update);
-    
-    printf("\n用户同步后状态: ");
+    // 应用更新
+    CRLManager_apply_update(user_manager, update3);
+    printf("用户同步后状态：\n");
     CRLManager_print(user_manager);
+    
+    // 保存用户CRL并打印文件大小
+    save_and_print_user_crl(user_manager, user_crl_file);
+    
+    // 释放更新包
+    CRLManager_free_update(update3);
+    
+    // 测试从文件加载
+    printf("\n测试从文件加载用户CRL\n");
+    CRLManager* loaded_manager = CRLManager_load_from_file(user_crl_file);
+    if (loaded_manager) {
+        printf("从文件加载的CRL状态：\n");
+        CRLManager_print(loaded_manager);
+        CRLManager_free(loaded_manager);
+    } else {
+        printf("从文件加载CRL失败\n");
+    }
     
     // 清理资源
-    CRLManager_free_update(update);
-    CRLManager_free_update(received_update);
-    free(buffer);
     CRLManager_free(ca_manager);
     CRLManager_free(user_manager);
     
     return 0;
 }
-

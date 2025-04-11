@@ -1,5 +1,5 @@
 #include "tools.h"
-#include "sm2.h"
+#include "gm_crypto.h"
 
 void print_hex(const char *name, const unsigned char *data, int data_len)
 {
