@@ -4,7 +4,7 @@ OPENSSL_DIR = /usr/local/openssl
 CFLAGS = -I./include -I$(OPENSSL_DIR)/include -L$(OPENSSL_DIR)/lib64 -l:libcrypto.so.3
 SRC_FILES = $(wildcard src/*.c)
 
-all: ca user cost
+all: ca user
 
 ca:
 	@echo "正在编译CA服务器..."
@@ -15,11 +15,6 @@ user:
 	@echo "正在编译User客户端..."
 	$(CC) server/user-client/user.c $(SRC_FILES) $(CFLAGS) -o server/user-client/user
 	@echo "User客户端编译成功！"
-
-cost:
-	@echo "正在编译Cost程序..."
-	$(CC) server/user-client/cost.c $(SRC_FILES) $(CFLAGS) -o server/user-client/cost
-	@echo "Cost程序编译成功！"
 
 web: mongoose
 	@echo "正在编译Web监控程序..."
@@ -36,8 +31,7 @@ mongoose:
 clean:
 	rm -f server/ca-server/ca
 	rm -f server/user-client/user
-	rm -f server/user-client/cost
 	rm -f webmonitor/webmonitor
 	@echo "清理完成！"
 
-.PHONY: all ca user cost web mongoose clean 
+.PHONY: all ca user web mongoose clean 

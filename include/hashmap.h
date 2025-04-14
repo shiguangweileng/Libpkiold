@@ -39,7 +39,7 @@ void hashmap_destroy(hashmap* map);
 bool hashmap_exists(hashmap* map, const void* key);
 void* hashmap_get(hashmap* map, const void* key);
 bool hashmap_put(hashmap* map, void* key, void* value, size_t value_size);
-void hashmap_remove(hashmap* map, const void* key);
+bool hashmap_remove(hashmap* map, const void* key);
 
 // 字符串键的哈希和比较函数
 size_t string_hash(const void* key, size_t size);

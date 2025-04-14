@@ -7,7 +7,6 @@
 #include <sys/stat.h>
 #include "common.h"
 #include "gm_crypto.h"
-#include "tools.h"
 #include "imp_cert.h"
 #include "hashmap.h"
 
@@ -28,6 +27,8 @@
 #define CMD_SEND_MESSAGE      0x05    // 用户发送消息、签名和证书
 #define CMD_VERIFY_CERT       0x06    // 用户查询证书有效性
 #define CMD_CERT_STATUS       0x07    // CA返回证书状态
+#define CMD_REQUEST_REVOKE    0x08    // 用户请求撤销证书
+#define CMD_REVOKE_RESPONSE   0x09    // CA返回撤销结果
 
 // 消息头部结构: 命令(1字节) + 长度(2字节)
 #define MSG_HEADER_SIZE 3
@@ -53,6 +54,7 @@ void handle_registration(int client_socket, const unsigned char *buffer, int dat
 void handle_cert_update(int client_socket, const unsigned char *buffer, int data_len);
 void handle_message(int client_socket, const unsigned char *buffer, int data_len);
 void handle_online_csp(int client_socket, const unsigned char *buffer, int data_len);
+void handle_cert_revoke(int client_socket, const unsigned char *buffer, int data_len);
 int local_generate_cert(const char *subject_id);
 int local_update_cert(const char *subject_id);
 
@@ -60,6 +62,7 @@ int local_update_cert(const char *subject_id);
 int check_user_exists(const char *subject_id);
 int save_user_list(const char *subject_id, const unsigned char *cert_hash);
 int update_user_list(const char *subject_id, const unsigned char *new_cert_hash);
+int delete_user_from_list(const char *subject_id);
 
 // CRL管理
 int check_cert_in_crl(const unsigned char *cert_hash);
@@ -282,6 +285,9 @@ void handle_client(int client_socket) {
             break;
         case CMD_VERIFY_CERT:
             handle_online_csp(client_socket, buffer, data_len);
+            break;
+        case CMD_REQUEST_REVOKE:
+            handle_cert_revoke(client_socket, buffer, data_len);
             break;
         default:
             printf("未知命令: 0x%02X\n", cmd);
@@ -704,6 +710,142 @@ void handle_online_csp(int client_socket, const unsigned char *buffer, int data_
     printf("已发送证书状态响应\n");
 }
 
+void handle_cert_revoke(int client_socket, const unsigned char *buffer, int data_len) {
+    // 验证接收的数据长度
+    if (data_len < SUBJECT_ID_LEN + 8 + 64) {  // ID + 时间戳 + 签名
+        printf("接收到的数据长度错误\n");
+        return;
+    }
+    
+    // 提取用户ID
+    char subject_id[SUBJECT_ID_SIZE] = {0};
+    memcpy(subject_id, buffer, SUBJECT_ID_LEN);
+    if (strlen(subject_id) != 8) {
+        printf("用户ID长度错误，必须为8个字符\n");
+        return;
+    }
+    printf("%s---证书撤销\n", subject_id);
+    
+    // 检查用户是否存在
+    if (!check_user_exists(subject_id)) {
+        printf("用户ID '%s' 不存在，无法撤销\n", subject_id);
+        return;
+    }
+    
+    // 获取时间戳
+    uint64_t timestamp;
+    memcpy(&timestamp, buffer + SUBJECT_ID_LEN, 8);
+    timestamp = be64toh(timestamp);  // 网络字节序转为主机字节序
+    
+    // 验证时间戳
+    if (!validate_timestamp(timestamp)) {
+        printf("撤销请求中的时间戳无效\n");
+        return;
+    }
+    
+    // 获取签名
+    unsigned char signature[64];
+    memcpy(signature, buffer + SUBJECT_ID_LEN + 8, 64);
+    
+    // 加载用户证书
+    char cert_filename[SUBJECT_ID_SIZE + 15] = {0};
+    sprintf(cert_filename, "%s/%s.crt", USERCERTS_DIR, subject_id);
+    
+    // 从用户哈希表获取证书哈希
+    unsigned char *cert_hash = hashmap_get(user_map, subject_id);
+    if (!cert_hash) {
+        printf("无法从用户列表中获取证书哈希\n");
+        return;
+    }
+    
+    ImpCert cert;
+    if (!load_cert(&cert, cert_filename)) {
+        printf("无法加载用户证书: %s\n", cert_filename);
+        return;
+    }
+    
+    // 从证书恢复用户公钥
+    EC_POINT *Pu = EC_POINT_new(group);
+    getPu(&cert, Pu);
+    
+    // 重构用户公钥 Qu = e*Pu + Q_ca
+    unsigned char Qu[SM2_PUB_MAX_SIZE];
+    rec_pubkey(Qu, cert_hash, Pu, Q_ca);
+    
+    // 验证签名
+    unsigned char sign_data[SUBJECT_ID_LEN + 8];
+    memcpy(sign_data, buffer, SUBJECT_ID_LEN + 8);
+    
+    if (!sm2_verify(signature, sign_data, SUBJECT_ID_LEN + 8, Qu)) {
+        printf("签名验证失败，拒绝撤销请求\n");
+        EC_POINT_free(Pu);
+        return;
+    }
+    
+    printf("签名验证成功，处理撤销请求...\n");
+    
+    // 获取用户证书的到期时间
+    time_t expire_time;
+    memcpy(&expire_time, cert.Validity + sizeof(time_t), sizeof(time_t));
+    
+    // 将证书加入撤销列表
+    if (!add_cert_to_crl(cert_hash, expire_time)) {
+        printf("警告：无法将证书添加到撤销列表\n");
+    }
+    
+    // 从用户列表中删除用户
+    if (!delete_user_from_list(subject_id)) {
+        printf("警告：更新用户列表文件失败，但用户已从内存中移除\n");
+    } else {
+        printf("用户 '%s' 的数据已从用户列表中移除\n", subject_id);
+    }
+    
+    // 删除用户证书文件
+    if (remove(cert_filename) == 0) {
+        printf("已删除用户证书文件: %s\n", cert_filename);
+    } else {
+        printf("警告：无法删除用户证书文件: %s\n", cert_filename);
+    }
+    
+    printf("用户 '%s' 的证书已成功撤销\n", subject_id);
+    
+    // 准备响应数据：状态(1字节) + 时间戳(8字节) + 签名(64字节)
+    // 状态：1=成功，0=失败
+    uint8_t status = 1;  // 成功
+    uint64_t response_time = time(NULL);
+    uint64_t ts_network = htobe64(response_time);  // 转换为网络字节序
+    
+    // 准备要签名的数据：状态 + 时间戳
+    unsigned char resp_sign_data[1 + 8];
+    resp_sign_data[0] = status;
+    memcpy(resp_sign_data + 1, &ts_network, 8);
+    
+    // 用CA私钥对数据签名
+    unsigned char resp_signature[64];
+    if (!sm2_sign(resp_signature, resp_sign_data, 1 + 8, d_ca)) {
+        printf("签名失败\n");
+        EC_POINT_free(Pu);
+        return;
+    }
+    
+    // 准备完整响应数据
+    unsigned char response[1 + 8 + 64];
+    response[0] = status;
+    memcpy(response + 1, &ts_network, 8);
+    memcpy(response + 1 + 8, resp_signature, 64);
+    
+    // 发送响应
+    if (!send_message(client_socket, CMD_REVOKE_RESPONSE, response, sizeof(response))) {
+        printf("发送撤销响应失败\n");
+    } else {
+        printf("已成功发送撤销响应给用户\n");
+        printf("--------------------------------\n");
+    }
+    
+    // 释放资源
+    EC_POINT_free(Pu);
+}
+
 int local_generate_cert(const char *subject_id) { 
     // 检查用户是否存在
     if (check_user_exists(subject_id)) {
@@ -948,7 +1090,9 @@ int local_update_cert(const char *subject_id) {
     }
 
     // 保存新证书到文件系统，覆盖现有文件
-    if (!save_cert(&new_cert, cert_filename)) {
+    if (save_cert(&new_cert, cert_filename)) {
+        printf("新用户证书已保存为 %s\n", cert_filename);
+    } else {
         printf("警告：无法保存新用户证书到文件\n");
     }
 
@@ -1025,6 +1169,17 @@ int save_user_list(const char *subject_id, const unsigned char *cert_hash) {
 
 int update_user_list(const char *subject_id, const unsigned char *new_cert_hash) {
     return hashmap_put(user_map, strdup(subject_id), (void*)new_cert_hash, CERT_HASH_LEN) ? 1 : 0;
+}
+
+int delete_user_from_list(const char *subject_id) {
+    // 从哈希表中删除用户
+    if (!hashmap_remove(user_map, subject_id)) {
+        printf("用户 '%s' 不存在于哈希表中\n", subject_id);
+        return 0;  // 删除失败
+    }
+    
+    // 更新用户列表文件
+    return ul_hashmap_save(user_map, USERLIST_FILE);
 }
 
 // ---- CRL管理相关函数 ----

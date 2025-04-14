@@ -8,7 +8,6 @@
 #include <sys/time.h>
 #include "common.h"
 #include "gm_crypto.h"
-#include "tools.h"
 #include "imp_cert.h"
 
 #define PORT 8000
@@ -22,6 +21,8 @@
 #define CMD_SEND_MESSAGE      0x05    // 用户发送消息、签名和证书
 #define CMD_VERIFY_CERT       0x06    // 用户查询证书有效性
 #define CMD_CERT_STATUS       0x07    // CA返回证书状态
+#define CMD_REQUEST_REVOKE    0x08    // 用户请求撤销证书
+#define CMD_REVOKE_RESPONSE   0x09    // CA返回撤销结果
 
 // 消息头部结构: 命令(1字节) + 数据长度(2字节)
 #define MSG_HEADER_SIZE 3
@@ -47,6 +48,7 @@ int request_registration(int sock, const char *user_id);
 int request_cert_update(int sock, const char *user_id);
 int send_signed_message(int sock, const char *user_id, const char *message);
 int online_csp(int sock, const unsigned char *cert_hash);
+int request_cert_revoke(int sock, const char *user_id);
 
 // 网络通信函数
 int send_message(int sock, uint8_t cmd, const void *data, uint16_t data_len);
@@ -112,7 +114,8 @@ int main() {
             printf("2. 更新现有证书\n");
             printf("3. 发送消息\n");
             printf("4. 查询证书有效性\n");
-            printf("5. 切换用户\n");
+            printf("5. 撤销证书\n");
+            printf("6. 切换用户\n");
 
             printf("请输入选择: ");
             if (scanf("%d", &choice) != 1) {
@@ -122,7 +125,7 @@ int main() {
             }
             
             // 检查是否要返回上一级菜单
-            if (choice == 5) {
+            if (choice == 6) {
                 user_session = 0; // 退出内层循环，返回到用户ID输入
                 continue;
             }
@@ -224,6 +227,18 @@ int main() {
                         }
                     }
                     break;
+                case 5:
+                    if (!has_cert) {
+                        printf("错误：需要先有证书才能撤销\n");
+                        close(sock);
+                        continue;
+                    }
+                    gettimeofday(&start_time, NULL); // 记录开始时间
+                    result = request_cert_revoke(sock, user_id);
+                    if (result) {
+                        has_cert = 0; // 撤销成功后，清除本地证书状态
+                    }
+                    break;
                 default:
                     printf("无效的选择\n");
                     result = 0;
@@ -251,6 +266,8 @@ int main() {
                     printf("发送消息的时间开销: %.2f ms\n", elapsed_ms);
                 } else if (choice == 4) {
                     printf("查询证书状态的时间开销: %.2f ms\n", elapsed_ms);
+                } else if (choice == 5) {
+                    printf("撤销证书的时间开销: %.2f ms\n", elapsed_ms);
                 }
             }
         }
@@ -320,7 +337,7 @@ int check_and_load_cert(const char *user_id) {
     }
     fclose(pub_file);
     
-    printf("已成功加载证书和密钥对\n");
+    printf("[[[成功加载证书和密钥对]]]\n");
     return 1;
 }
 
@@ -399,8 +416,12 @@ int request_registration(int sock, const char *user_id) {
 
     printf("已成功接收证书和部分私钥r\n");
     // 保存证书供后续使用
-    save_cert(&cert, cert_filename);
-    printf("用户证书已保存到 %s\n", cert_filename);
+    if(!save_cert(&cert, cert_filename)){
+        printf("保存证书失败\n");
+        BN_free(Ku);
+        EC_POINT_free(Ru);
+        return 0;
+    }
     
     //--------step3:用户端生成最终的公私钥对-------------
     // 获取隐式证书中的Pu
@@ -415,7 +436,6 @@ int request_registration(int sock, const char *user_id) {
     // 公钥重构 Qu=e×Pu+Q_ca
     unsigned char Qu[SM2_PUB_MAX_SIZE];
     rec_pubkey(Qu, e, Pu, Q_ca);
-    print_hex("公钥重构值Qu", Qu, SM2_PUB_MAX_SIZE);
 
     // 计算最终私钥d_u=e×Ku+r (mod n)
     unsigned char d_u[SM2_PRI_MAX_SIZE];
@@ -423,9 +443,7 @@ int request_registration(int sock, const char *user_id) {
     print_hex("用户私钥d_u", d_u, SM2_PRI_MAX_SIZE);
 
     // 验证密钥对
-    if(verify_key_pair_bytes(group, Qu, d_u)){
-        printf("密钥对验证成功！\n");
-    }else{
+    if(!verify_key_pair_bytes(group, Qu, d_u)){
         printf("密钥对验证失败！\n");
         BN_free(Ku);
         EC_POINT_free(Ru);
@@ -438,7 +456,6 @@ int request_registration(int sock, const char *user_id) {
     if (key_file) {
         fwrite(d_u, 1, SM2_PRI_MAX_SIZE, key_file);
         fclose(key_file);
-        printf("用户私钥已保存到 %s\n", priv_key_filename);
     } else {
         printf("警告：无法保存用户私钥到文件\n");
     }
@@ -448,7 +465,6 @@ int request_registration(int sock, const char *user_id) {
     if (pub_key_file) {
         fwrite(Qu, 1, SM2_PUB_MAX_SIZE, pub_key_file);
         fclose(pub_key_file);
-        printf("用户公钥已保存到 %s\n", pub_key_filename);
     } else {
         printf("警告：无法保存用户公钥到文件\n");
     }
@@ -457,7 +473,6 @@ int request_registration(int sock, const char *user_id) {
     BN_free(Ku);
     EC_POINT_free(Ru);
     EC_POINT_free(Pu);
-    
     printf("注册过程完成\n");
     
     return 1;
@@ -562,16 +577,13 @@ int request_cert_update(int sock, const char *user_id) {
     // 公钥重构 Qu=e×Pu+Q_ca
     unsigned char Qu[SM2_PUB_MAX_SIZE];
     rec_pubkey(Qu, e, Pu, Q_ca);
-    print_hex("新公钥重构值Qu", Qu, SM2_PUB_MAX_SIZE);
 
     // 计算最终私钥d_u=e×Ku+r (mod n)
     unsigned char d_u[SM2_PRI_MAX_SIZE];
     calculate_r(d_u, e, Ku, r, order);
 
     // 验证密钥对
-    if(verify_key_pair_bytes(group, Qu, d_u)) {
-        printf("新密钥对验证成功！\n");
-    } else {
+    if(!verify_key_pair_bytes(group, Qu, d_u)) {
         printf("新密钥对验证失败！\n");
         BN_free(Ku);
         EC_POINT_free(Ru);
@@ -705,6 +717,12 @@ int online_csp(int sock, const unsigned char *cert_hash) {
     // 转换为主机字节序
     timestamp = be64toh(timestamp);
     
+    // 使用validate_timestamp函数验证时间戳
+    if (!validate_timestamp(timestamp)) {
+        printf("证书状态响应中的时间戳无效\n");
+        return -1;
+    }
+    
     // 验证CA签名
     // 签名数据：证书哈希 + 状态 + 时间戳
     unsigned char signed_data[CERT_HASH_SIZE + 1 + 8];
@@ -723,17 +741,118 @@ int online_csp(int sock, const unsigned char *cert_hash) {
         return -1;
     }
     
-    // 验证时间戳是否在有效范围内（当前时间与消息时间戳相差不超过3秒）
-    time_t current_time = time(NULL);
-    time_t time_diff = labs((long)(current_time - (time_t)timestamp));
-    
-    if (time_diff > 3) {
-        printf("时间戳验证失败！消息时间戳与当前时间相差 %ld 秒，超过阈值(3秒)\n", time_diff);
-        return -1;
-    }
-    
     // 返回证书状态
     return status;
+}
+
+// 请求撤销证书
+int request_cert_revoke(int sock, const char *user_id) {
+    // 检查证书和私钥是否已加载
+    if (!has_cert) {
+        printf("错误：找不到用户证书\n");
+        return 0;
+    }
+    
+    // 获取当前时间戳
+    time_t now = time(NULL);
+    uint64_t timestamp = (uint64_t)now;
+    uint64_t ts_network = htobe64(timestamp);  // 转换为网络字节序
+    
+    // 准备要签名的数据：用户ID + 时间戳
+    unsigned char sign_data[SUBJECT_ID_LEN + 8];
+    memcpy(sign_data, user_id, SUBJECT_ID_LEN);
+    memcpy(sign_data + SUBJECT_ID_LEN, &ts_network, 8);
+    
+    // 使用用户私钥对数据签名
+    unsigned char signature[64];
+    if (!sm2_sign(signature, sign_data, SUBJECT_ID_LEN + 8, priv_key)) {
+        printf("撤销请求签名失败\n");
+        return 0;
+    }
+    
+    // 准备发送的数据：ID + 时间戳 + 签名
+    unsigned char request_data[SUBJECT_ID_LEN + 8 + 64];
+    memcpy(request_data, user_id, SUBJECT_ID_LEN);
+    memcpy(request_data + SUBJECT_ID_LEN, &ts_network, 8);
+    memcpy(request_data + SUBJECT_ID_LEN + 8, signature, 64);
+    
+    // 发送撤销请求
+    if (!send_message(sock, CMD_REQUEST_REVOKE, request_data, sizeof(request_data))) {
+        printf("发送撤销请求失败\n");
+        return 0;
+    }
+     
+    // 接收撤销响应
+    unsigned char response[BUFFER_SIZE];
+    uint8_t resp_cmd;
+    int resp_len = recv_message(sock, &resp_cmd, response, BUFFER_SIZE);
+    
+    if (resp_len < 0 || resp_cmd != CMD_REVOKE_RESPONSE) {
+        printf("接收撤销响应失败或响应命令错误\n");
+        return 0;
+    }
+    
+    // 检查响应长度
+    if (resp_len < 1 + 8 + 64) {  // 状态 + 时间戳 + 签名
+        printf("撤销响应数据长度错误\n");
+        return 0;
+    }
+    
+    // 解析响应状态
+    uint8_t status = response[0];
+    
+    // 解析时间戳
+    uint64_t resp_timestamp;
+    memcpy(&resp_timestamp, response + 1, 8);
+    resp_timestamp = be64toh(resp_timestamp);  // 网络字节序转为主机字节序
+    
+    // 使用validate_timestamp函数验证时间戳
+    if (!validate_timestamp(resp_timestamp)) {
+        printf("撤销响应中的时间戳无效\n");
+        return 0;
+    }
+    
+    // 获取签名
+    unsigned char resp_signature[64];
+    memcpy(resp_signature, response + 1 + 8, 64);
+    
+    // 验证签名
+    unsigned char resp_sign_data[1 + 8];
+    resp_sign_data[0] = status;
+    uint64_t ts_network_copy = htobe64(resp_timestamp);
+    memcpy(resp_sign_data + 1, &ts_network_copy, 8);
+    
+    if (!sm2_verify(resp_signature, resp_sign_data, 1 + 8, Q_ca)) {
+        printf("撤销响应签名验证失败\n");
+        return 0;
+    }
+    
+    // 检查状态
+    if (status != 1) {
+        printf("撤销失败，CA返回状态: %d\n", status);
+        return 0;
+    }
+    
+    printf("证书撤销成功！正在清理本地证书文件...\n");
+    
+    // 删除本地证书文件
+    char cert_filename[100];
+    sprintf(cert_filename, "%s.crt", user_id);
+    remove(cert_filename);
+    
+    // 删除本地私钥文件
+    char priv_key_filename[100];
+    sprintf(priv_key_filename, "%s_priv.key", user_id);
+    remove(priv_key_filename);
+    
+    // 删除本地公钥文件
+    char pub_key_filename[100];
+    sprintf(pub_key_filename, "%s_pub.key", user_id);
+    remove(pub_key_filename);
+    
+    printf("本地证书文件清理完成\n");
+    
+    return 1;
 }
 
 //----------------网络通信函数实现-------------------

@@ -197,8 +197,8 @@ bool hashmap_put(hashmap* map, void* key, void* value, size_t value_size) {
 }
 
 // 移除键值对
-void hashmap_remove(hashmap* map, const void* key) {
-    if (!map || !key) return;
+bool hashmap_remove(hashmap* map, const void* key) {
+    if (!map || !key) return false;
     
     size_t index = map->hash_func(key, map->size);
     hashmap_entry* entry = map->entries[index];
@@ -217,11 +217,13 @@ void hashmap_remove(hashmap* map, const void* key) {
             
             free(entry);
             map->count--;
-            return;
+            return true;  // 成功删除
         }
         prev = entry;
         entry = entry->next;
     }
+    
+    return false;  // 未找到要删除的键
 }
 
 // ======= 用户列表特定函数 =======

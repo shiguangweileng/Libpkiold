@@ -143,13 +143,13 @@ void print_cert_info(const ImpCert *cert) {
     time_t start_time, end_time;
     memcpy(&start_time, cert->Validity, sizeof(time_t));
     memcpy(&end_time, cert->Validity + sizeof(time_t), sizeof(time_t));
-    printf("证书信息:\n");
-    printf("序列号: %s\n", cert->SerialNum);
-    printf("颁发者: %s\n", cert->IssuerID);
-    printf("主体ID: %s\n", cert->SubjectID);
-    printf("生效时间: %s", ctime(&start_time));
-    printf("到期时间: %s", ctime(&end_time));
-    printf("部分公钥: ");
+    printf("---证书信息:\n");
+    printf("---序列号: %s\n", cert->SerialNum);
+    printf("---颁发者: %s\n", cert->IssuerID);
+    printf("---主体ID: %s\n", cert->SubjectID);
+    printf("---生效时间: %s", ctime(&start_time));
+    printf("---到期时间: %s", ctime(&end_time));
+    printf("---部分公钥: ");
     for (int i = 0; i < 33; i++) {
         printf("%02x", cert->PubKey[i]);
     }

@@ -2,25 +2,5 @@
     "code-runner.executorMap": {
         "c": "cd $dir && clear && gcc $fileName $workspaceRoot/src/*.c -I$workspaceRoot/include -lcrypto -o $fileNameWithoutExt && $dir$fileNameWithoutExt",
     },
-    "files.associations": {
-        "*.json": "json",
-        "crypto.h": "c",
-        "param_build.h": "c",
-        "common.h": "c",
-        "tools.h": "c",
-        "string.h": "c",
-        "sm2.h": "c",
-        "implicit_cert.h": "c",
-        "bn.h": "c",
-        "stddef.h": "c",
-        "stdio.h": "c",
-        "ec.h": "c",
-        "evp.h": "c",
-        "time.h": "c",
-        "asn1.h": "c",
-        "hashmap.h": "c",
-        "stdbool.h": "c",
-        "opensslconf.h": "c"
-    },
     "makefile.configureOnOpen": false
 }
