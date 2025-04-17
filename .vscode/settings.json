@@ -1,6 +1,10 @@
 {
     "code-runner.executorMap": {
-        "c": "cd $dir && clear && gcc $fileName $workspaceRoot/src/*.c -I$workspaceRoot/include -lcrypto -o $fileNameWithoutExt && $dir$fileNameWithoutExt",
+        "c": "cd $dir && clear && gcc $fileName $workspaceRoot/src/*.c -I$workspaceRoot/include -lpthread -lcrypto -o $fileNameWithoutExt && $dir$fileNameWithoutExt",
     },
-    "makefile.configureOnOpen": false
+    "makefile.configureOnOpen": false,
+    "files.associations": {
+        "*.json": "json",
+        "stdio.h": "c"
+    }
 }

@@ -29,6 +29,8 @@ EXPORT int User_init(unsigned char *pub);
 // 调试类
 EXPORT void print_hex(const char *name, const unsigned char *data, int data_len);
 EXPORT void print_bn(const char *name, const BIGNUM *bn);
+EXPORT int parse_hex_hash(unsigned char *cert_hash, int hash_size);
+EXPORT void clear_input_buffer();
 
 // 计算r=e×k+d (mod n)
 EXPORT int calculate_r(unsigned char *r, const unsigned char *e, const BIGNUM *k, 
@@ -42,5 +44,6 @@ EXPORT int verify_key_pair_bytes(const EC_GROUP *group, const unsigned char *pub
 
 // 验证时间戳是否在合理范围内(当前时间前后TS_MAX_DIFF秒内)
 EXPORT int validate_timestamp(uint64_t timestamp);
+
 
 #endif

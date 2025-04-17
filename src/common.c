@@ -245,4 +245,37 @@ int validate_timestamp(uint64_t timestamp) {
     return 1;
 }
 
+// 从十六进制字符串读取证书哈希值
+int parse_hex_hash(unsigned char *cert_hash, int hash_size) {
+    char hex_hash[hash_size * 2 + 1]; // 十六进制字符串加上\0
+    memset(hex_hash, 0, sizeof(hex_hash));
+    
+    // 请求用户输入证书哈希值（十六进制形式）
+    printf("请输入证书哈希值（十六进制格式，%d字符）: ", hash_size * 2);
+    if (scanf("%s", hex_hash) != 1) {
+        printf("输入格式错误\n");
+        return 0;
+    }
+    
+    // 检查输入的哈希值长度是否正确
+    if (strlen(hex_hash) != hash_size * 2) {
+        printf("哈希值长度错误，应为%d字符\n", hash_size * 2);
+        return 0;
+    }
+    
+    // 将十六进制字符串转换为二进制形式
+    for (int i = 0; i < hash_size; i++) {
+        char byte_str[3] = {hex_hash[i*2], hex_hash[i*2+1], '\0'};
+        cert_hash[i] = (unsigned char)strtol(byte_str, NULL, 16);
+    }
+    
+    return 1;
+}
+
+// 清空输入缓冲区
+void clear_input_buffer() {
+    int c;
+    while ((c = getchar()) != '\n' && c != EOF);
+}
+
 

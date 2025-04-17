@@ -3,6 +3,37 @@
 #include <string.h>
 #include "crlmanager.h"
 
+// 辅助函数：扩展CRLNode节点数组容量
+static int expand_nodes_array(CRLManager* manager) {
+    if (!manager) return 0;
+    
+    int new_capacity = manager->capacity * 2;
+    CRLNode* new_nodes = (CRLNode*)realloc(manager->nodes, new_capacity * sizeof(CRLNode));
+    if (!new_nodes) return 0;
+    
+    // 初始化新增节点
+    for (int i = manager->capacity; i < new_capacity; i++) {
+        new_nodes[i].hash = NULL;
+        new_nodes[i].is_valid = 0;
+    }
+    
+    manager->nodes = new_nodes;
+    manager->capacity = new_capacity;
+    return 1;
+}
+
+// 辅助函数：扩展删除记录数组容量
+static int expand_removed_array(CRLManager* manager) {
+    if (!manager || !manager->RemovedCRL) return 0;
+    
+    int new_capacity = manager->removed_capacity * 2;
+    int* new_removed = (int*)realloc(manager->RemovedCRL, new_capacity * sizeof(int));
+    if (!new_removed) return 0;
+    
+    manager->RemovedCRL = new_removed;
+    manager->removed_capacity = new_capacity;
+    return 1;
+}
 
 // 辅助函数：释放整个AddedCRL对象
 static void free_added_crl(AddedCRL* added) {
@@ -32,6 +63,7 @@ static void free_del_crl(DelCRL* del_crl) {
 }
 
 // 初始化CRL管理器
+// 用户端的CRL管理器不应该有removed_capacity,所以user初始化时removed_capacity=0
 CRLManager* CRLManager_init(int initial_capacity, int removed_capacity) {
     CRLManager* manager = (CRLManager*)malloc(sizeof(CRLManager));
     if (!manager) return NULL;
@@ -87,48 +119,33 @@ void CRLManager_free(CRLManager* manager) {
 
 // 添加新的CRL节点
 int CRLManager_add_node(CRLManager* manager, const unsigned char* hash) {
-    if (!manager || !hash) return -1;
+    if (!manager || !hash) return 0;
 
     // 检查是否需要扩容
     if (manager->base_v >= manager->capacity) {
-        int new_capacity = manager->capacity * 2;
-        CRLNode* new_nodes = (CRLNode*)realloc(manager->nodes, new_capacity * sizeof(CRLNode));
-        if (!new_nodes) return -1;
-        
-        // 初始化新增节点的hash指针为NULL
-        for (int i = manager->capacity; i < new_capacity; i++) {
-            new_nodes[i].hash = NULL;
-            new_nodes[i].is_valid = 0;
-        }
-        
-        manager->nodes = new_nodes;
-        manager->capacity = new_capacity;
+        if (!expand_nodes_array(manager)) return 0;
     }
 
     // 分配哈希值内存并复制
     manager->nodes[manager->base_v].hash = (unsigned char*)malloc(32);
-    if (!manager->nodes[manager->base_v].hash) return -1;
+    if (!manager->nodes[manager->base_v].hash) return 0;
     
     memcpy(manager->nodes[manager->base_v].hash, hash, 32);
     manager->nodes[manager->base_v].is_valid = 1;
     manager->base_v++;
 
-    return manager->base_v - 1; // 返回新节点的版本号
+    return 1; // 返回成功
 }
 
 // 删除CRL节点
 int CRLManager_remove_node(CRLManager* manager, int version) {
-    if (!manager || version < 0 || version >= manager->base_v) return -1;
+    if (!manager || version < 0 || version >= manager->base_v) return 0;
 
     // 如果RemovedCRL已分配，则记录删除的版本号
     if (manager->RemovedCRL) {
         // 检查RemovedCRL是否需要扩容
         if (manager->removed_v >= manager->removed_capacity) {
-            int new_capacity = manager->removed_capacity * 2;
-            int* new_removed = (int*)realloc(manager->RemovedCRL, new_capacity * sizeof(int));
-            if (!new_removed) return -1;
-            manager->RemovedCRL = new_removed;
-            manager->removed_capacity = new_capacity;
+            if (!expand_removed_array(manager)) return 0;
         }
 
         // 将版本号添加到RemovedCRL数组
@@ -144,7 +161,7 @@ int CRLManager_remove_node(CRLManager* manager, int version) {
     manager->nodes[version].is_valid = 0;
     manager->removed_v++;
 
-    return 0;
+    return 1;
 }
 
 // 生成AddedCRL增量包
@@ -424,9 +441,9 @@ UpdatedCRL* CRLManager_deserialize_update(const unsigned char* buffer, int buffe
     return updated_crl;
 }
 
-// 应用更新到本地CRL管理器
-int CRLManager_apply_update(CRLManager* manager, const UpdatedCRL* updated_crl) {
-    if (!manager || !updated_crl) return -1;
+// 应用更新到本地CRL管理器和local_crl哈希表
+int CRLManager_apply_update(CRLManager* manager, const UpdatedCRL* updated_crl, hashmap* local_crl) {
+    if (!manager || !updated_crl) return 0;
 
     // 使用临时变量简化代码
     const AddedCRL* added = updated_crl->added;
@@ -439,24 +456,30 @@ int CRLManager_apply_update(CRLManager* manager, const UpdatedCRL* updated_crl) 
         for (int i = 0; i < added_count; i++) {
             const CRLNode* node = &added->nodes[i];
             if (node->is_valid && node->hash) {
-                if (CRLManager_add_node(manager, node->hash) < 0) {
-                    return -1;
+                // 添加到CRLManager
+                if (!CRLManager_add_node(manager, node->hash)) {
+                    return 0;
+                }
+                
+                // 如果提供了local_crl哈希表，也添加到哈希表中
+                if (local_crl) {
+                    // 分配内存用于存储哈希值的副本
+                    unsigned char* hash_copy = malloc(32);
+                    if (!hash_copy) return 0;
+                    
+                    // 复制哈希值
+                    memcpy(hash_copy, node->hash, 32);
+                    
+                    // 将哈希值加入local_crl，不存储值
+                    if (!hashmap_put(local_crl, hash_copy, NULL, 0)) {
+                        free(hash_copy);
+                        return 0;
+                    }
                 }
             } else {
                 // 添加无效节点以保持索引一致性
                 if (manager->base_v >= manager->capacity) {
-                    int new_capacity = manager->capacity * 2;
-                    CRLNode* new_nodes = (CRLNode*)realloc(manager->nodes, new_capacity * sizeof(CRLNode));
-                    if (!new_nodes) return -1;
-                    
-                    // 初始化新增节点
-                    for (int j = manager->capacity; j < new_capacity; j++) {
-                        new_nodes[j].hash = NULL;
-                        new_nodes[j].is_valid = 0;
-                    }
-                    
-                    manager->nodes = new_nodes;
-                    manager->capacity = new_capacity;
+                    if (!expand_nodes_array(manager)) return 0;
                 }
                 
                 manager->nodes[manager->base_v].hash = NULL;
@@ -469,13 +492,23 @@ int CRLManager_apply_update(CRLManager* manager, const UpdatedCRL* updated_crl) 
     // 应用删除节点
     if (del_crl) {
         for (int i = 0; i < del_count; i++) {
-            if (CRLManager_remove_node(manager, del_crl->del_versions[i]) < 0) {
-                return -1;
+            int version = del_crl->del_versions[i];
+            
+            // 从local_crl中删除哈希值
+            if (local_crl && version >= 0 && version < manager->base_v) {
+                if (manager->nodes[version].hash) {
+                    hashmap_remove(local_crl, manager->nodes[version].hash);
+                }
+            }
+            
+            // 从CRLManager中删除节点
+            if (!CRLManager_remove_node(manager, version)) {
+                return 0;
             }
         }
     }
 
-    return 0;
+    return 1;
 }
 
 // 打印CRL状态
@@ -496,10 +529,10 @@ void CRLManager_print(CRLManager* manager) {
 
 // 将CRLManager持久化到文件
 int CRLManager_save_to_file(const CRLManager* manager, const char* filename) {
-    if (!manager || !filename) return -1;
+    if (!manager || !filename) return 0;
     
     FILE* file = fopen(filename, "wb");
-    if (!file) return -1;
+    if (!file) return 0;
     
     // 写入基本信息
     if (fwrite(&manager->base_v, sizeof(int), 1, file) != 1 ||
@@ -507,7 +540,7 @@ int CRLManager_save_to_file(const CRLManager* manager, const char* filename) {
         fwrite(&manager->removed_v, sizeof(int), 1, file) != 1 ||
         fwrite(&manager->removed_capacity, sizeof(int), 1, file) != 1) {
         fclose(file);
-        return -1;
+        return 0;
     }
     
     // 写入节点数组，对于每个节点，先写入is_valid标志
@@ -515,14 +548,14 @@ int CRLManager_save_to_file(const CRLManager* manager, const char* filename) {
         // 写入有效标志
         if (fwrite(&manager->nodes[i].is_valid, sizeof(int), 1, file) != 1) {
             fclose(file);
-            return -1;
+            return 0;
         }
         
         // 如果节点有效且哈希值存在，则写入哈希值
         if (manager->nodes[i].is_valid && manager->nodes[i].hash) {
             if (fwrite(manager->nodes[i].hash, 32, 1, file) != 1) {
                 fclose(file);
-                return -1;
+                return 0;
             }
         }
     }
@@ -531,12 +564,12 @@ int CRLManager_save_to_file(const CRLManager* manager, const char* filename) {
     if (manager->RemovedCRL && manager->removed_v > 0) {
         if (fwrite(manager->RemovedCRL, sizeof(int), manager->removed_v, file) != manager->removed_v) {
             fclose(file);
-            return -1;
+            return 0;
         }
     }
     
     fclose(file);
-    return 0;
+    return 1;
 }
 
 // 从文件加载CRLManager

@@ -76,89 +76,6 @@ static int export_pub(unsigned char **pub, size_t *pub_len, BIGNUM *pri)
 }
 
 /**
- * 将SM2签名从ASN.1格式转换为RS格式
-* 
- * @param out [out] 输出缓冲区，用于存储转换后的签名
- * @param out_len [out] 输出签名的长度
- * @param in [in] 输入的ASN.1格式签名
- * @param in_len [in] 输入签名的长度
- * @return 成功返回1，失败返回0
- * 
- * 说明：将ASN.1编码的SM2签名转换为RS格式，即签名值r和s的连接
- */
-int sm2_sig_to_rs(unsigned char *out, const unsigned char *in, int in_len)
-{
-    if (!out || !in)
-        return 0;
-    SM2_SIGNATURE *seq = NULL;
-    int success =
-        d2i_SM2_SIGNATURE(&seq, &in, in_len) &&
-        BN_bn2bin(seq->r, out) &&
-        BN_bn2bin(seq->s, out += 32);
-    if (seq)
-    {
-        SM2_SIGNATURE_free(seq);
-        seq = NULL;
-    }
-    return success;
-}
-
-/**
- * 生成SM2密钥对
-* 
- * @param pub [out] 输出缓冲区，用于存储生成的公钥
- * @param pub_len [out] 输出公钥的长度
- * @param pri [out] 输出缓冲区，用于存储生成的私钥
- * @param pri_len [out] 输出私钥的长度
- * @return 成功返回1，失败返回0
- * 
- * 说明：生成一对新的SM2公私钥对
- */
-int sm2_key_pair_new(unsigned char *pub, unsigned char *pri)
-{
-    // 生成SM2密钥对
-    EVP_PKEY *pkey = EVP_EC_gen(SN_sm2);
-    if (!pkey) {
-        printf("EVP_EC_gen失败: \n");
-        return 0;
-    }
-
-    // // 打印密钥详细信息（用于调试）
-    // BIO *bio_out = BIO_new_fp(stdout, BIO_NOCLOSE);
-    // printf("\n===== SM2密钥详细信息 =====\n");
-    // EVP_PKEY_print_private(bio_out, pkey, 0, NULL);
-    // BIO_free(bio_out);
-    
-    int success = 0;
-    size_t pub_len = SM2_PUB_MAX_SIZE;
-    BIGNUM *priv_bn = NULL;
-    if (!EVP_PKEY_get_octet_string_param(pkey, "pub", pub, pub_len, &pub_len)) {
-        printf("获取公钥数据失败\n");
-        goto cleanup;
-    }
-    
-    // 获取私钥数据
-    if (!EVP_PKEY_get_bn_param(pkey, "priv", &priv_bn)) {
-        printf("获取私钥数据失败\n");
-        goto cleanup;
-    }
-    
-    // 将私钥转换为二进制形式
-    BN_bn2bin(priv_bn, pri);
-    
-    success = 1;
-    
-cleanup:
-    if (priv_bn) {
-        BN_free(priv_bn);
-    }
-    if (pkey) {
-        EVP_PKEY_free(pkey);
-    }
-    return success;
-}
-
-/**
  * 创建新的密钥对象
 * 
  * @param key [in] 输入的密钥数据
@@ -296,6 +213,90 @@ static int rs_to_asn1(unsigned char *out, size_t *out_len, const unsigned char *
 }
 
 /**
+ * 将SM2签名从ASN.1格式转换为RS格式
+* 
+ * @param out [out] 输出缓冲区，用于存储转换后的签名
+ * @param out_len [out] 输出签名的长度
+ * @param in [in] 输入的ASN.1格式签名
+ * @param in_len [in] 输入签名的长度
+ * @return 成功返回1，失败返回0
+ * 
+ * 说明：将ASN.1编码的SM2签名转换为RS格式，即签名值r和s的连接
+ */
+int sm2_sig_to_rs(unsigned char *out, const unsigned char *in, int in_len)
+{
+    if (!out || !in)
+        return 0;
+    SM2_SIGNATURE *seq = NULL;
+    int success =
+        d2i_SM2_SIGNATURE(&seq, &in, in_len) &&
+        BN_bn2bin(seq->r, out) &&
+        BN_bn2bin(seq->s, out += 32);
+    if (seq)
+    {
+        SM2_SIGNATURE_free(seq);
+        seq = NULL;
+    }
+    return success;
+}
+
+/**
+ * 生成SM2密钥对
+* 
+ * @param pub [out] 输出缓冲区，用于存储生成的公钥
+ * @param pub_len [out] 输出公钥的长度
+ * @param pri [out] 输出缓冲区，用于存储生成的私钥
+ * @param pri_len [out] 输出私钥的长度
+ * @return 成功返回1，失败返回0
+ * 
+ * 说明：生成一对新的SM2公私钥对
+ */
+int sm2_key_pair_new(unsigned char *pub, unsigned char *pri)
+{
+    // 生成SM2密钥对
+    EVP_PKEY *pkey = EVP_EC_gen(SN_sm2);
+    if (!pkey) {
+        printf("EVP_EC_gen失败: \n");
+        return 0;
+    }
+
+    // // 打印密钥详细信息（用于调试）
+    // BIO *bio_out = BIO_new_fp(stdout, BIO_NOCLOSE);
+    // printf("\n===== SM2密钥详细信息 =====\n");
+    // EVP_PKEY_print_private(bio_out, pkey, 0, NULL);
+    // BIO_free(bio_out);
+    
+    int success = 0;
+    size_t pub_len = SM2_PUB_MAX_SIZE;
+    BIGNUM *priv_bn = NULL;
+    if (!EVP_PKEY_get_octet_string_param(pkey, "pub", pub, pub_len, &pub_len)) {
+        printf("获取公钥数据失败\n");
+        goto cleanup;
+    }
+    
+    // 获取私钥数据
+    if (!EVP_PKEY_get_bn_param(pkey, "priv", &priv_bn)) {
+        printf("获取私钥数据失败\n");
+        goto cleanup;
+    }
+    
+    // 将私钥转换为二进制形式
+    BN_bn2bin(priv_bn, pri);
+    
+    success = 1;
+    
+cleanup:
+    if (priv_bn) {
+        BN_free(priv_bn);
+    }
+    if (pkey) {
+        EVP_PKEY_free(pkey);
+    }
+    return success;
+}
+
+
+/**
  * SM2签名操作(一次性完成)，产生R||S格式的签名
 * 
  * @param sig [out] 输出缓冲区，用于存储生成的签名，必须至少有64字节
@@ -412,6 +413,12 @@ int sm2_verify(const unsigned char *sig, const unsigned char *in, size_t in_len,
     
     return ret;
 }
+
+
+
+
+
+
 
 /* SM3相关函数实现 */
 

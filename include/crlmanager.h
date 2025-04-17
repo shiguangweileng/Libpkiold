@@ -2,6 +2,7 @@
 #define CRLMANAGER_H
 
 #include <stdint.h>
+#include "hashmap.h"
 
 // CRL节点结构
 typedef struct {
@@ -48,16 +49,16 @@ int CRLManager_add_node(CRLManager* manager, const unsigned char* hash);
 int CRLManager_remove_node(CRLManager* manager, int version);
 void CRLManager_print(CRLManager* manager);
 
-// CA端函数声明
+// ca增量更新生成
 AddedCRL* CRLManager_generate_added_crl(CRLManager* manager, int user_base_v);
 DelCRL* CRLManager_generate_del_crl(CRLManager* manager, int user_removed_v);
 UpdatedCRL* CRLManager_generate_update(CRLManager* manager, int user_base_v, int user_removed_v);
 int CRLManager_serialize_update(const UpdatedCRL* updated_crl, unsigned char* buffer, int buffer_size);
 void CRLManager_free_update(UpdatedCRL* updated_crl);
 
-// User端函数声明
+// user端增量更新解析
 UpdatedCRL* CRLManager_deserialize_update(const unsigned char* buffer, int buffer_size);
-int CRLManager_apply_update(CRLManager* manager, const UpdatedCRL* updated_crl);
+int CRLManager_apply_update(CRLManager* manager, const UpdatedCRL* updated_crl, hashmap* local_crl);
 
 // 持久化和加载函数声明
 int CRLManager_save_to_file(const CRLManager* manager, const char* filename);

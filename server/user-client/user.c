@@ -9,10 +9,13 @@
 #include "common.h"
 #include "gm_crypto.h"
 #include "imp_cert.h"
+#include "hashmap.h"
+#include "crlmanager.h"
 
 #define PORT 8000
-#define BUFFER_SIZE 2048
+#define BUFFER_SIZE 8192
 
+#define CRL_MANAGER_FILE "CRLManager.dat"
 // 通信协议常量
 #define CMD_SEND_ID_AND_RU    0x01    // 用户发送ID和Ru
 #define CMD_SEND_CERT_AND_R   0x02    // CA发送证书和部分私钥r
@@ -23,6 +26,8 @@
 #define CMD_CERT_STATUS       0x07    // CA返回证书状态
 #define CMD_REQUEST_REVOKE    0x08    // 用户请求撤销证书
 #define CMD_REVOKE_RESPONSE   0x09    // CA返回撤销结果
+#define CMD_REQUEST_CRL_UPDATE 0x0A   // 用户请求CRL增量更新
+#define CMD_SEND_CRL_UPDATE   0x0B    // CA发送CRL增量更新
 
 // 消息头部结构: 命令(1字节) + 数据长度(2字节)
 #define MSG_HEADER_SIZE 3
@@ -33,6 +38,8 @@
 
 // 存储相关信息的全局变量
 ImpCert loaded_cert;
+hashmap* local_crl = NULL;  // 新增local_crl哈希表，只存储证书哈希值
+CRLManager* crl_manager = NULL;
 unsigned char priv_key[SM2_PRI_MAX_SIZE];
 unsigned char pub_key[SM2_PUB_MAX_SIZE];
 unsigned char Q_ca[SM2_PUB_MAX_SIZE];
@@ -40,14 +47,19 @@ int has_cert = 0;
 
 //----------------函数声明-------------------
 
-// 证书处理函数
-int check_and_load_cert(const char *user_id);
+// CRL相关函数
+int init_crl_manager();
+int load_crl_manager_to_hashmap();
+int check_cert_in_local_crl(const unsigned char *cert_hash);
+int sync_crl_with_ca(int sock);
+int online_csp(int sock, const unsigned char *cert_hash);
+int local_csp(const unsigned char *cert_hash);
 
-// 用户证书操作函数
+// 用户操作
+int check_and_load_cert(const char *user_id);
 int request_registration(int sock, const char *user_id);
 int request_cert_update(int sock, const char *user_id);
 int send_signed_message(int sock, const char *user_id, const char *message);
-int online_csp(int sock, const unsigned char *cert_hash);
 int request_cert_revoke(int sock, const char *user_id);
 
 // 网络通信函数
@@ -55,12 +67,9 @@ int send_message(int sock, uint8_t cmd, const void *data, uint16_t data_len);
 int recv_message(int sock, uint8_t *cmd, void *data, uint16_t max_len);
 int connect_to_server(const char *ip, int port);
 
-// 辅助函数
-void clear_input_buffer();
-
 //----------------主函数-------------------
 int main() {
-    char server_ip[16] = {0}; // 存储用户输入的服务器IP地址
+    char server_ip[16] = {0};
     char user_id[SUBJECT_ID_SIZE] = {0};
     int choice = 0;
     int sock = -1;
@@ -70,6 +79,13 @@ int main() {
     
     if (!User_init(Q_ca)) {
         printf("加载CA公钥失败！\n");
+        sm2_params_cleanup();
+        return -1;
+    }
+    
+    // 初始化CRL管理器和哈希表
+    if (!init_crl_manager()) {
+        printf("初始化CRL管理器失败！\n");
         sm2_params_cleanup();
         return -1;
     }
@@ -112,10 +128,13 @@ int main() {
             printf("\n用户 [%s] 请选择操作:\n", user_id);
             printf("1. 注册新证书\n");
             printf("2. 更新现有证书\n");
-            printf("3. 发送消息\n");
-            printf("4. 查询证书有效性\n");
+            printf("3. 发送签名消息\n");
+            printf("4. 在线查询证书有效性\n");
             printf("5. 撤销证书\n");
-            printf("6. 切换用户\n");
+            printf("6. 同步CRL\n");
+            printf("7. 证书状态比对(在线+本地)\n");
+            printf("8. 切换用户\n");
+            printf("0. 退出程序\n");
 
             printf("请输入选择: ");
             if (scanf("%d", &choice) != 1) {
@@ -124,9 +143,13 @@ int main() {
                 continue;
             }
             
-            // 检查是否要返回上一级菜单
-            if (choice == 6) {
-                user_session = 0; // 退出内层循环，返回到用户ID输入
+            // 检查是否要退出程序
+            if (choice == 0) {
+                user_session = 0;
+                running = 0;
+                continue;
+            } else if (choice == 8) {
+                user_session = 0; // 退出当前用户会话，返回到用户ID输入
                 continue;
             }
             
@@ -160,8 +183,6 @@ int main() {
                         close(sock);
                         continue;
                     }
-                    
-                    // 清空输入缓冲区
                     clear_input_buffer();
                     
                     // 获取要发送的消息
@@ -187,30 +208,14 @@ int main() {
                     {
                         // 处理证书状态查询
                         unsigned char cert_hash[CERT_HASH_SIZE];
-                        char hex_hash[CERT_HASH_SIZE * 2 + 1] = {0}; // 十六进制字符串加上\0
                         
-                        // 清空输入缓冲区
                         clear_input_buffer();
                         
-                        // 请求用户输入证书哈希值（十六进制形式）
-                        printf("请输入证书哈希值（十六进制格式，64字符）: ");
-                        if (scanf("%64s", hex_hash) != 1) {
-                            printf("输入格式错误\n");
+
+                        if (!parse_hex_hash(cert_hash, CERT_HASH_SIZE)) {
+                            printf("证书哈希输入错误\n");
                             close(sock);
                             continue;
-                        }
-                        
-                        // 检查输入的哈希值长度是否正确
-                        if (strlen(hex_hash) != CERT_HASH_SIZE * 2) {
-                            printf("哈希值长度错误，应为64字符\n");
-                            close(sock);
-                            continue;
-                        }
-                        
-                        // 将十六进制字符串转换为二进制形式
-                        for (int i = 0; i < CERT_HASH_SIZE; i++) {
-                            char byte_str[3] = {hex_hash[i*2], hex_hash[i*2+1], '\0'};
-                            cert_hash[i] = (unsigned char)strtol(byte_str, NULL, 16);
                         }
                         
                         // 在用户完成输入后再开始计时
@@ -237,6 +242,39 @@ int main() {
                     result = request_cert_revoke(sock, user_id);
                     if (result) {
                         has_cert = 0; // 撤销成功后，清除本地证书状态
+                    }
+                    break;
+                case 6:
+                    gettimeofday(&start_time, NULL); // 记录开始时间
+                    result = sync_crl_with_ca(sock);
+                    break;
+                case 7:
+                    {
+                        unsigned char cert_hash[CERT_HASH_SIZE];
+                        clear_input_buffer();
+                        
+                        if (!parse_hex_hash(cert_hash, CERT_HASH_SIZE)) {
+                            printf("证书哈希输入错误\n");
+                            close(sock);
+                            continue;
+                        }
+                        
+                        gettimeofday(&start_time, NULL);
+                        
+                        printf("正在进行在线证书状态查询...\n");
+                        int online_status = online_csp(sock, cert_hash);
+                        if (online_status >= 0) {
+                            printf("online_csp:%s\n", online_status ? "有效" : "无效（已撤销）");
+                        } else {
+                            printf("online_csp: 查询失败\n");
+                            close(sock);
+                            continue;
+                        }
+                        
+                        printf("正在进行本地证书状态查询...\n");
+                        int local_status = local_csp(cert_hash);
+                        printf("local_csp:%s\n", local_status ? "有效" : "无效（已撤销）");
+                        result = 1; // 查询成功
                     }
                     break;
                 default:
@@ -268,19 +306,30 @@ int main() {
                     printf("查询证书状态的时间开销: %.2f ms\n", elapsed_ms);
                 } else if (choice == 5) {
                     printf("撤销证书的时间开销: %.2f ms\n", elapsed_ms);
+                } else if (choice == 6) {
+                    printf("同步证书撤销列表的时间开销: %.2f ms\n", elapsed_ms);
+                } else if (choice == 7) {
+                    printf("证书状态比对的时间开销: %.2f ms\n", elapsed_ms);
                 }
             }
         }
     }
     
+    // 程序结束时释放资源
+    if (crl_manager) {
+        // 保存CRL管理器
+        if (!CRLManager_save_to_file(crl_manager, CRL_MANAGER_FILE)) {
+            printf("保存CRL管理器失败！\n");
+        }
+        CRLManager_free(crl_manager);
+    }
+    
+    if (local_crl) {
+        hashmap_destroy(local_crl);
+    }
+    
     sm2_params_cleanup();
     return 0;
-}
-
-//----------------辅助函数实现-------------------
-void clear_input_buffer() {
-    int c;
-    while ((c = getchar()) != '\n' && c != EOF);
 }
 
 //----------------证书处理函数实现-------------------
@@ -946,4 +995,186 @@ int connect_to_server(const char *ip, int port) {
         return -1;
     }
     return sock;
+}
+
+//----------------CRL相关函数实现-------------------
+int init_crl_manager() {
+    // 初始化local_crl哈希表，初始大小为512
+    local_crl = crl_hashmap_create(512);
+    if (!local_crl) {
+        printf("创建local_crl哈希表失败！\n");
+        return 0;
+    }
+    
+    // 尝试从文件加载CRL管理器
+    crl_manager = CRLManager_load_from_file(CRL_MANAGER_FILE);
+    if (!crl_manager) {
+        printf("无法加载CRL管理器，创建新的管理器...\n");
+        // 用户端的CRL管理器不需要存储已删除节点的版本号，所以removed_capacity=0
+        crl_manager = CRLManager_init(512, 0);
+        if (!crl_manager) {
+            printf("创建CRL管理器失败！\n");
+            hashmap_destroy(local_crl);
+            local_crl = NULL;
+            return 0;
+        }
+    } else {
+        // 从crl_manager加载有效节点到local_crl
+        if (!load_crl_manager_to_hashmap()) {
+            printf("从CRL管理器加载数据到哈希表失败！\n");
+            hashmap_destroy(local_crl);
+            local_crl = NULL;
+            CRLManager_free(crl_manager);
+            crl_manager = NULL;
+            return 0;
+        }
+    }
+    
+    return 1;
+}
+
+int load_crl_manager_to_hashmap() {
+    if (!crl_manager || !local_crl) return 0;
+    
+    // 遍历crl_manager中的所有节点
+    for (int i = 0; i < crl_manager->base_v; i++) {
+        // 只处理有效节点
+        if (crl_manager->nodes[i].is_valid && crl_manager->nodes[i].hash) {
+            // 分配内存用于存储哈希值的副本
+            unsigned char* hash_copy = malloc(32);
+            if (!hash_copy) return 0;
+            
+            // 复制哈希值
+            memcpy(hash_copy, crl_manager->nodes[i].hash, 32);
+            
+            // 将哈希值加入local_crl，不存储值
+            if (!hashmap_put(local_crl, hash_copy, NULL, 0)) {
+                free(hash_copy);
+                return 0;
+            }
+        }
+    }
+    return 1;
+}
+
+// 本地检查证书是否在CRL中
+int check_cert_in_local_crl(const unsigned char *cert_hash) {
+    if (!local_crl || !cert_hash) return 0;
+    
+    // 使用哈希表快速检查证书哈希是否存在
+    return hashmap_exists(local_crl, cert_hash);
+}
+
+// 与CA同步CRL数据
+int sync_crl_with_ca(int sock) {
+
+    int version_info[2];
+    version_info[0] = crl_manager->base_v;      // 当前节点基础版本号
+    version_info[1] = crl_manager->removed_v;   // 当前已删除节点版本号
+    
+    printf("current_v:(%d,%d)\n",version_info[0],version_info[1]);
+    
+    if (!send_message(sock, CMD_REQUEST_CRL_UPDATE, version_info, sizeof(version_info))) {
+        printf("发送CRL同步请求失败\n");
+        return 0;
+    }
+    
+    unsigned char buffer[BUFFER_SIZE] = {0};
+    uint8_t cmd;
+    int data_len = recv_message(sock, &cmd, buffer, BUFFER_SIZE);
+    
+    if (data_len < 0) {
+        printf("接收CRL更新数据失败\n");
+        return 0;
+    }
+    
+    if (cmd != CMD_SEND_CRL_UPDATE) {
+        printf("接收到错误的命令类型: %d\n", cmd);
+        return 0;
+    }
+    
+    if (data_len == 0) {
+        printf("当前CRL已是最新版本\n");
+        return 1;
+    }
+    
+    // 检查数据长度是否至少包含时间戳(8字节)和签名(64字节)
+    if (data_len <= 8 + 64) {
+        printf("接收到的CRL更新数据长度错误\n");
+        return 0;
+    }
+    
+    // 提取时间戳和签名
+    int crl_data_len = data_len - 8 - 64;
+    uint64_t timestamp;
+    unsigned char signature[64];
+    
+    memcpy(&timestamp, buffer + crl_data_len, 8);
+    memcpy(signature, buffer + crl_data_len + 8, 64);
+    
+    // 将时间戳从网络字节序转换为主机字节序
+    timestamp = be64toh(timestamp);
+    
+    // 验证时间戳是否有效
+    if (!validate_timestamp(timestamp)) {
+        printf("CRL更新中的时间戳无效\n");
+        return 0;
+    }
+    
+    // 准备签名验证数据：CRL数据 + 时间戳(网络字节序)
+    unsigned char *verify_data = malloc(crl_data_len + 8);
+    if (!verify_data) {
+        printf("内存分配失败\n");
+        return 0;
+    }
+    
+    memcpy(verify_data, buffer, crl_data_len);
+    // 时间戳使用网络字节序
+    uint64_t ts_network = htobe64(timestamp);
+    memcpy(verify_data + crl_data_len, &ts_network, 8);
+    
+    // 用CA公钥验证签名
+    if (!sm2_verify(signature, verify_data, crl_data_len + 8, Q_ca)) {
+        printf("CA签名验证失败！此CRL更新可能不是来自合法CA\n");
+        free(verify_data);
+        return 0;
+    }
+    
+    free(verify_data);
+    printf("CRL更新数据的签名验证成功\n");
+    
+    // 反序列化更新数据
+    UpdatedCRL* updated_crl = CRLManager_deserialize_update(buffer, crl_data_len);
+    if (!updated_crl) {
+        printf("解析CRL更新数据失败\n");
+        return 0;
+    }
+    
+    printf("收到CRL更新：新增节点=%d, 删除节点=%d\n", 
+           updated_crl->added_count, updated_crl->del_count);
+    
+    // 应用更新到本地CRL管理器和local_crl哈希表
+    if (!CRLManager_apply_update(crl_manager, updated_crl, local_crl)) {
+        printf("应用CRL更新失败\n");
+        CRLManager_free_update(updated_crl);
+        return 0;
+    }
+    CRLManager_free_update(updated_crl);
+    
+    // 保存更新后的CRL管理器
+    if (!CRLManager_save_to_file(crl_manager, CRL_MANAGER_FILE)) {
+        printf("保存更新后的CRL管理器失败\n");
+        return 0;
+    }
+    
+    printf("current_v:(%d,%d)\n",crl_manager->base_v,crl_manager->removed_v);
+    
+    return 1;
+}
+
+// 本地证书状态检查
+int local_csp(const unsigned char *cert_hash) {
+    // 如果证书在CRL中存在，表示已撤销，返回0表示无效
+    // 如果不在CRL中，表示有效，返回1
+    return !check_cert_in_local_crl(cert_hash);
 }

@@ -41,15 +41,13 @@ void* hashmap_get(hashmap* map, const void* key);
 bool hashmap_put(hashmap* map, void* key, void* value, size_t value_size);
 bool hashmap_remove(hashmap* map, const void* key);
 
-// 字符串键的哈希和比较函数
+// 字符串键、二进制数据的哈希和比较函数
 size_t string_hash(const void* key, size_t size);
 bool string_compare(const void* key1, const void* key2);
-
-// 二进制数据的哈希和比较函数
 size_t binary_hash(const void* key, size_t size);
 bool binary_compare(const void* key1, const void* key2);
 
-// 用户列表特定函数
+// userlist特定函数
 hashmap* ul_hashmap_create(size_t size);
 hashmap* ul_hashmap_load(const char* filename, size_t size);
 bool ul_hashmap_save(hashmap* map, const char* filename);

@@ -1,7 +1,7 @@
 CC = gcc
 # OpenSSL安装路径，可根据不同环境修改
 OPENSSL_DIR = /usr/local/openssl
-CFLAGS = -I./include -I$(OPENSSL_DIR)/include -L$(OPENSSL_DIR)/lib64 -l:libcrypto.so.3
+CFLAGS = -I./include -I$(OPENSSL_DIR)/include -L$(OPENSSL_DIR)/lib64 -l:libcrypto.so.3 -lpthread
 SRC_FILES = $(wildcard src/*.c)
 
 all: ca user

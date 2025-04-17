@@ -5,18 +5,21 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <pthread.h>
 #include "common.h"
 #include "gm_crypto.h"
 #include "imp_cert.h"
 #include "hashmap.h"
+#include "crlmanager.h"
 
 #define PORT 8000
 #define BUFFER_SIZE 2048
 #define CRL_FILE "CRL.txt"
 #define USERDATA_DIR "UserData"          // 本地模式下存储用户数据的目录
 #define USERCERTS_DIR "UserCerts"        // 存储用户证书的目录
-#define USERLIST_FILE "UserList.txt"
+#define USERLIST_FILE "UserList.txt"     // 用户列表文件
 #define SERIAL_NUM_FILE "SerialNum.txt"  // 序列号持久化文件
+#define CRL_MANAGER_FILE "CRLManager.dat" // CRL管理器文件
 #define SERIAL_NUM_FORMAT "SN%06d"       // 序列号格式，6位数字前缀为SN
 #define SERIAL_NUM_MAX 999999            // 序列号最大值
 // 通信协议常量
@@ -29,6 +32,8 @@
 #define CMD_CERT_STATUS       0x07    // CA返回证书状态
 #define CMD_REQUEST_REVOKE    0x08    // 用户请求撤销证书
 #define CMD_REVOKE_RESPONSE   0x09    // CA返回撤销结果
+#define CMD_REQUEST_CRL_UPDATE 0x0A   // 用户请求CRL增量更新
+#define CMD_SEND_CRL_UPDATE   0x0B    // CA发送CRL增量更新
 
 // 消息头部结构: 命令(1字节) + 长度(2字节)
 #define MSG_HEADER_SIZE 3
@@ -41,13 +46,19 @@ unsigned char Q_ca[SM2_PUB_MAX_SIZE];
 
 hashmap* user_map = NULL;           // 存储用户ID和证书哈希
 hashmap* crl_map = NULL;            // 存储被撤销的证书哈希和其到期时间
+CRLManager* crl_manager = NULL;     // CA端的CRL管理器
 unsigned int current_serial_num = 1;  // 当前证书序列号，默认从1开始
+
+// 线程相关
+pthread_t server_thread;           // 服务器监听线程
+volatile int server_running = 0;   // 服务器运行状态标志
 
 // 网络通信
 int send_message(int sock, uint8_t cmd, const void *data, uint16_t data_len);
 int recv_message(int sock, uint8_t *cmd, void *data, uint16_t max_len);
 int setup_server(int port);
 void handle_client(int client_socket);
+void* server_thread_func(void* arg); // 服务器监听线程函数
 
 // 证书处理
 void handle_registration(int client_socket, const unsigned char *buffer, int data_len);
@@ -55,6 +66,7 @@ void handle_cert_update(int client_socket, const unsigned char *buffer, int data
 void handle_message(int client_socket, const unsigned char *buffer, int data_len);
 void handle_online_csp(int client_socket, const unsigned char *buffer, int data_len);
 void handle_cert_revoke(int client_socket, const unsigned char *buffer, int data_len);
+void handle_crl_update(int client_socket, const unsigned char *buffer, int data_len);
 int local_generate_cert(const char *subject_id);
 int local_update_cert(const char *subject_id);
 
@@ -67,6 +79,7 @@ int delete_user_from_list(const char *subject_id);
 // CRL管理
 int check_cert_in_crl(const unsigned char *cert_hash);
 int add_cert_to_crl(const unsigned char *cert_hash, time_t expire_time);
+int add_cert_to_crlmanager(const unsigned char *cert_hash);
 
 // 序列号管理
 int load_serial_num();
@@ -76,6 +89,9 @@ char* generate_serial_num();
 // 运行模式
 void run_local_mode();
 void run_online_mode();
+
+// 调试功能
+void debug_remove_cert();
 
 int ensure_directory_exists(const char *dir_path) {
     struct stat st = {0};
@@ -125,6 +141,20 @@ int main() {
         sm2_params_cleanup();
         return -1;
     }
+    
+    // 加载或初始化CRLManager
+    crl_manager = CRLManager_load_from_file(CRL_MANAGER_FILE);
+    if (!crl_manager) {
+        printf("无法加载CRL管理器，创建新的管理器...\n");
+        crl_manager = CRLManager_init(512, 512);
+        if (!crl_manager) {
+            printf("无法创建CRL管理器！\n");
+            hashmap_destroy(crl_map);
+            hashmap_destroy(user_map);
+            sm2_params_cleanup();
+            return -1;
+        }
+    }
 
     printf("CA服务器初始化完成...\n\n");
     
@@ -142,9 +172,7 @@ int main() {
         return -1;
     }
     
-    // 清空输入缓冲区
-    int c;
-    while ((c = getchar()) != '\n' && c != EOF);
+    clear_input_buffer();
     
     // 根据选择进入相应模式
     if (mode_choice == 1) {
@@ -158,6 +186,10 @@ int main() {
     // 程序结束时清理资源
     hashmap_destroy(user_map);
     hashmap_destroy(crl_map);
+    if (crl_manager) {
+        CRLManager_save_to_file(crl_manager, CRL_MANAGER_FILE);
+        CRLManager_free(crl_manager);
+    }
     sm2_params_cleanup();
     
     return 0;
@@ -257,8 +289,6 @@ int setup_server(int port) {
         close(server_fd);
         return -1;
     }
-    
-    printf("CA服务器启动成功，等待用户连接...\n");
     return server_fd;
 }
 
@@ -288,6 +318,9 @@ void handle_client(int client_socket) {
             break;
         case CMD_REQUEST_REVOKE:
             handle_cert_revoke(client_socket, buffer, data_len);
+            break;
+        case CMD_REQUEST_CRL_UPDATE:
+            handle_crl_update(client_socket, buffer, data_len);
             break;
         default:
             printf("未知命令: 0x%02X\n", cmd);
@@ -516,7 +549,7 @@ void handle_cert_update(int client_socket, const unsigned char *buffer, int data
     // 生成新隐式证书
     ImpCert new_cert;
     time_t current_time = time(NULL);
-    time_t expire_time = current_time + 30; // 30s有效期
+    time_t expire_time = current_time + 60*60; // 1h有效期
     if(!set_cert(&new_cert, 
               (unsigned char *)serial_num,
               (unsigned char *)"CA000001", 
@@ -546,11 +579,14 @@ void handle_cert_update(int client_socket, const unsigned char *buffer, int data
         printf("警告：无法将旧证书添加到撤销列表\n");
     }
     
+    // 将旧证书加入CRL管理器
+    if (!add_cert_to_crlmanager(old_cert_hash)) {
+        printf("警告：无法将旧证书添加到CRL管理器\n");
+    }
+    
     // 更新用户信息到UserList.txt
     if (!update_user_list(subject_id, new_cert_hash)) {
         printf("更新用户数据失败！\n");
-    } else {
-        printf("用户 '%s' 的数据已在UserList.txt中更新\n", subject_id);
     }
 
     // 保存新证书到文件系统，覆盖现有文件
@@ -675,7 +711,7 @@ void handle_online_csp(int client_socket, const unsigned char *buffer, int data_
     
     
     // 检查证书是否在撤销列表中
-    uint8_t cert_status = !check_cert_in_crl(cert_hash); // 1=有效，0=已撤销
+    int cert_status = !check_cert_in_crl(cert_hash); // 1=有效，0=已撤销
 
     // 获取当前时间戳
     time_t current_time = time(NULL);
@@ -793,6 +829,11 @@ void handle_cert_revoke(int client_socket, const unsigned char *buffer, int data
         printf("警告：无法将证书添加到撤销列表\n");
     }
     
+    // 将证书加入CRL管理器
+    if (!add_cert_to_crlmanager(cert_hash)) {
+        printf("警告：无法将证书添加到CRL管理器\n");
+    }
+    
     // 从用户列表中删除用户
     if (!delete_user_from_list(subject_id)) {
         printf("警告：更新用户列表文件失败，但用户已从内存中移除\n");
@@ -844,6 +885,106 @@ void handle_cert_revoke(int client_socket, const unsigned char *buffer, int data
     
     // 释放资源
     EC_POINT_free(Pu);
+}
+
+void handle_crl_update(int client_socket, const unsigned char *buffer, int data_len) {
+    // 验证接收到的数据长度
+    if (data_len != sizeof(int) * 2) {
+        printf("接收到的CRL版本信息长度错误\n");
+        return;
+    }
+    
+    // 解析用户的版本信息
+    int user_base_v, user_removed_v;
+    memcpy(&user_base_v, buffer, sizeof(int));
+    memcpy(&user_removed_v, buffer + sizeof(int), sizeof(int));
+    printf("user_v:(%d,%d)\nca_v:(%d,%d)\n",user_base_v,user_removed_v,crl_manager->base_v,crl_manager->removed_v);
+    
+    // 检查用户版本是否为最新
+    if (user_base_v == crl_manager->base_v && 
+        user_removed_v == crl_manager->removed_v) {
+        printf("用户CRL已是最新版本，无需更新\n");
+        // 发送空数据表示无需更新
+        send_message(client_socket, CMD_SEND_CRL_UPDATE, NULL, 0);
+        return;
+    }
+
+    UpdatedCRL* updated_crl = CRLManager_generate_update(crl_manager, 
+                                                        user_base_v, 
+                                                        user_removed_v);
+    if (!updated_crl) {
+        printf("生成CRL增量更新失败\n");
+        send_message(client_socket, CMD_SEND_CRL_UPDATE, NULL, 0);
+        return;
+    }
+    
+    printf("生成CRL增量更新：新增节点=%d, 删除节点=%d\n", 
+           updated_crl->added_count, updated_crl->del_count);
+    
+    unsigned char update_buffer[BUFFER_SIZE];
+    int serialized_size = CRLManager_serialize_update(updated_crl, update_buffer, BUFFER_SIZE);
+    
+    if (serialized_size < 0) {
+        printf("序列化CRL增量更新失败\n");
+        CRLManager_free_update(updated_crl);
+        send_message(client_socket, CMD_SEND_CRL_UPDATE, NULL, 0);
+        return;
+    }
+    
+    // 获取当前时间戳
+    time_t now = time(NULL);
+    uint64_t timestamp = (uint64_t)now;
+    uint64_t ts_network = htobe64(timestamp);  // 转换为网络字节序
+    
+    // 准备要签名的数据：序列化数据 + 时间戳
+    unsigned char *sign_data = malloc(serialized_size + 8);
+    if (!sign_data) {
+        printf("内存分配失败\n");
+        CRLManager_free_update(updated_crl);
+        send_message(client_socket, CMD_SEND_CRL_UPDATE, NULL, 0);
+        return;
+    }
+    
+    // 复制序列化数据和时间戳到签名数据中
+    memcpy(sign_data, update_buffer, serialized_size);
+    memcpy(sign_data + serialized_size, &ts_network, 8);
+    
+    // 计算签名
+    unsigned char signature[64];
+    if (!sm2_sign(signature, sign_data, serialized_size + 8, d_ca)) {
+        printf("计算CRL更新签名失败\n");
+        free(sign_data);
+        CRLManager_free_update(updated_crl);
+        send_message(client_socket, CMD_SEND_CRL_UPDATE, NULL, 0);
+        return;
+    }
+    
+    free(sign_data);
+    
+    // 准备完整的发送数据：序列化数据 + 时间戳 + 签名
+    unsigned char *send_data = malloc(serialized_size + 8 + 64);
+    if (!send_data) {
+        printf("内存分配失败\n");
+        CRLManager_free_update(updated_crl);
+        send_message(client_socket, CMD_SEND_CRL_UPDATE, NULL, 0);
+        return;
+    }
+    
+    memcpy(send_data, update_buffer, serialized_size);
+    memcpy(send_data + serialized_size, &ts_network, 8);
+    memcpy(send_data + serialized_size + 8, signature, 64);
+    
+    // 发送增量更新给用户
+    if (!send_message(client_socket, CMD_SEND_CRL_UPDATE, 
+                     send_data, serialized_size + 8 + 64)) {
+        printf("发送CRL增量更新失败\n");
+    } else {
+        printf("成功发送CRL增量更新，大小=%d字节\n", serialized_size + 8 + 64);
+        printf("--------------------------------\n");
+    }
+    
+    free(send_data);
+    CRLManager_free_update(updated_crl);
 }
 
 int local_generate_cert(const char *subject_id) { 
@@ -1084,6 +1225,11 @@ int local_update_cert(const char *subject_id) {
         printf("警告：无法将旧证书添加到撤销列表\n");
     }
     
+    // 将旧证书加入CRL管理器
+    if (!add_cert_to_crlmanager(old_cert_hash)) {
+        printf("警告：无法将旧证书添加到CRL管理器\n");
+    }
+    
     // 更新用户信息到UserList.txt
     if (!update_user_list(subject_id, new_cert_hash)) {
         printf("更新用户数据失败！\n");
@@ -1273,8 +1419,7 @@ void run_local_mode() {
         if (scanf("%d", &choice) != 1) {
             printf("输入错误，请重新输入\n");
             // 清空输入缓冲区
-            int c;
-            while ((c = getchar()) != '\n' && c != EOF);
+            clear_input_buffer();
             continue;
         }
         
@@ -1285,20 +1430,19 @@ void run_local_mode() {
         }
         
         // 清空输入缓冲区
-        int c;
-        while ((c = getchar()) != '\n' && c != EOF);
+        clear_input_buffer();
         
         // 获取用户ID
         printf("请输入用户ID (必须是8个字符): ");
         if (scanf("%8s", subject_id) != 1 || strlen(subject_id) != 8) {
             printf("ID输入错误，必须是8个字符\n");
             // 清空输入缓冲区
-            while ((c = getchar()) != '\n' && c != EOF);
+            clear_input_buffer();
             continue;
         }
         
         // 清空输入缓冲区
-        while ((c = getchar()) != '\n' && c != EOF);
+        clear_input_buffer();
         
         switch (choice) {
             case 1:
@@ -1325,13 +1469,17 @@ void run_local_mode() {
         if(!save_serial_num()){
             printf("保存序列号失败！\n");
         }
+        // 保存CRL管理器
+        if(!CRLManager_save_to_file(crl_manager, CRL_MANAGER_FILE)){
+            printf("保存CRL管理器失败！\n");
+        }
     }
 }
 
 void run_online_mode() {
-    int server_fd, client_socket;
-    struct sockaddr_in address;
-    int addrlen = sizeof(address);
+    int server_fd;
+    int choice = 0;
+    char input_buffer[128] = {0};
     
     printf("===== CA服务器-线上模式 =====\n");
     
@@ -1341,27 +1489,159 @@ void run_online_mode() {
         return;
     }
     
-    while(1) {
+    // 启动服务器监听线程
+    server_running = 1;
+    if (pthread_create(&server_thread, NULL, server_thread_func, &server_fd) != 0) {
+        perror("创建服务器线程失败");
+        close(server_fd);
+        return;
+    }
+    
+    printf("CA服务器已成功启动\n");
+    
+    // 主线程显示菜单并处理用户输入
+    while (server_running) {
+        printf("\n===== CA服务器控制菜单 =====\n");
+        printf("1. 删除证书调试\n");
+        printf("0. 退出服务器\n");
+        printf("请输入选择: ");
+        
+        if (fgets(input_buffer, sizeof(input_buffer), stdin) == NULL) {
+            continue;
+        }
+        
+        // 去除输入中的换行符
+        input_buffer[strcspn(input_buffer, "\n")] = 0;
+        
+        if (sscanf(input_buffer, "%d", &choice) != 1) {
+            printf("输入错误，请重新输入\n");
+            continue;
+        }
+        
+        switch (choice) {
+            case 1:
+                debug_remove_cert();
+                break;
+                
+            case 0:
+                server_running = 0;
+                printf("正在关闭服务器...\n");
+                break;
+                
+            default:
+                printf("无效的选择，请重新输入\n");
+                break;
+        }
+    }
+    
+    // 等待服务器线程结束
+    pthread_join(server_thread, NULL);
+    
+    // 关闭服务器socket
+    close(server_fd);
+    printf("CA服务器已关闭\n");
+}
+
+int add_cert_to_crlmanager(const unsigned char *cert_hash) {
+    if (!crl_manager || !cert_hash) {
+        return 0;
+    }
+    
+    return CRLManager_add_node(crl_manager, cert_hash);
+}
+
+// 调试用函数：删除证书
+void debug_remove_cert() {
+    unsigned char cert_hash[32] = {0}; // 存储二进制形式的证书哈希
+    int i, found = 0;
+    
+    printf("\n===== 证书删除调试功能 =====\n");
+    clear_input_buffer();
+    
+    // 使用parse_hex_hash函数从用户输入获取证书哈希值
+    if (!parse_hex_hash(cert_hash, 32)) {
+        printf("证书哈希输入错误\n");
+        return;
+    }
+    
+    // 检查证书是否在CRL哈希表中
+    if (hashmap_exists(crl_map, cert_hash)) {
+        printf("证书在CRL哈希表中找到\n");
+        
+        // 从CRL哈希表中删除
+        if (!hashmap_remove(crl_map, cert_hash)) {
+            printf("从CRL哈希表中删除证书失败\n");
+        }
+    } else {
+        printf("证书在CRL哈希表中未找到\n");
+    }
+    
+    // 在CRL管理器中查找并删除证书
+    if (crl_manager) {
+        for (i = 0; i < crl_manager->base_v; i++) {
+            if (crl_manager->nodes[i].is_valid && crl_manager->nodes[i].hash) {
+                if (memcmp(crl_manager->nodes[i].hash, cert_hash, 32) == 0) {
+                    found = 1;
+                    printf("证书在CRL管理器中找到，版本号: %d\n", i);
+                    
+                    // 从CRL管理器中删除
+                    if (!CRLManager_remove_node(crl_manager, i)) {
+                        printf("从CRL管理器中删除证书失败\n");
+                    }
+                    break;
+                }
+            }
+        }
+        
+        if (!found) {
+            printf("证书在CRL管理器中未找到\n");
+        }
+    } else {
+        printf("CRL管理器未初始化\n");
+    }
+    
+    // 保存更改
+    if (!crl_hashmap_save(crl_map, CRL_FILE)) {
+        printf("保存CRL列表失败！\n");
+    }
+    
+    if (crl_manager && !CRLManager_save_to_file(crl_manager, CRL_MANAGER_FILE)) {
+        printf("保存CRL管理器失败！\n");
+    }
+    
+    printf("操作完成\n");
+    printf("===========================\n");
+}
+
+// 服务器监听线程函数
+void* server_thread_func(void* arg) {
+    int server_fd = *((int*)arg);
+    int client_socket;
+    struct sockaddr_in address;
+    int addrlen = sizeof(address);
+    
+    printf("监听线程已启动，等待客户端连接...\n");
+    
+    while(server_running) {
+        // 接受客户端连接（阻塞模式）
         if ((client_socket = accept(server_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen)) < 0) {
+            // 当server_running变为0时，可能会返回错误，忽略它
+            if (!server_running) break;
             perror("接受连接失败");
             continue;
         }
         handle_client(client_socket);
-        close(client_socket);
+        
         // 保存信息
-        if(!ul_hashmap_save(user_map, USERLIST_FILE)){
-            printf("保存用户列表失败！\n");
-        }
-        if(!crl_hashmap_save(crl_map, CRL_FILE)){
-            printf("保存CRL列表失败！\n");
-        }
-        // 保存序列号
-        if(!save_serial_num()){
-            printf("保存序列号失败！\n");
-        }
+        ul_hashmap_save(user_map, USERLIST_FILE);
+        crl_hashmap_save(crl_map, CRL_FILE);
+        save_serial_num();
+        CRLManager_save_to_file(crl_manager, CRL_MANAGER_FILE);
+        
+        close(client_socket);
     }
     
-    // 程序结束时清理资源
-    close(server_fd);
+    printf("监听线程已退出\n");
+    return NULL;
 }
 

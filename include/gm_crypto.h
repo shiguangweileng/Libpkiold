@@ -6,11 +6,6 @@
 
 /* SM2相关定义 */
 
-/**
- * @brief SM2签名上下文结构体
- * 
- * 用于存储签名/验签过程中的各种OpenSSL上下文对象
- */
 typedef struct sm2_sig_ctx_st
 {
     int is_pri;           // 标识是否为私钥操作：1-签名(私钥)，0-验证(公钥)
