@@ -49,7 +49,7 @@ int CA_init(unsigned char *pub, unsigned char *priv)
     if (pub_fp == NULL) {
         return 0;
     }
-    size_t read_bytes = fread(pub, 1, SM2_PUB_MAX_SIZE, pub_fp);
+    int read_bytes = fread(pub, 1, SM2_PUB_MAX_SIZE, pub_fp);
     fclose(pub_fp);
     if (read_bytes != SM2_PUB_MAX_SIZE) {
         return 0;
@@ -79,7 +79,7 @@ int User_init(unsigned char *pub){
     if (pub_fp == NULL) {
         return 0;
     }
-    size_t read_bytes = fread(pub, 1, SM2_PUB_MAX_SIZE, pub_fp);
+    int read_bytes = fread(pub, 1, SM2_PUB_MAX_SIZE, pub_fp);
     fclose(pub_fp);
     if (read_bytes != SM2_PUB_MAX_SIZE) {
         return 0;

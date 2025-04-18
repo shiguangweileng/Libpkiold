@@ -110,7 +110,7 @@ int save_cert(const ImpCert *cert, const char *filename)
     }
     
     // 写入证书数据
-    size_t written = fwrite(cert, sizeof(ImpCert), 1, fp);
+    int written = fwrite(cert, sizeof(ImpCert), 1, fp);
     
     // 关闭文件
     fclose(fp);
@@ -131,7 +131,7 @@ int load_cert(ImpCert *cert, const char *filename)
     }
     
     // 读取证书数据
-    size_t read = fread(cert, sizeof(ImpCert), 1, fp);
+    int read = fread(cert, sizeof(ImpCert), 1, fp);
     
     // 关闭文件
     fclose(fp);

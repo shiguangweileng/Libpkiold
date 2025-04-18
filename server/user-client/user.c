@@ -89,6 +89,8 @@ int main() {
         
         // 检查本地是否存在该ID的证书
         has_cert = load_keys_and_cert(user_id);
+        // print_hex("用户公钥Qu", pub_key, SM2_PUB_MAX_SIZE);
+        // print_hex("用户私钥r", priv_key, SM2_PRI_MAX_SIZE);
         
         // 内层循环 - 处理当前用户的多次操作
         int user_session = 1;
@@ -156,7 +158,7 @@ int main() {
                     }
                     
                     // 移除消息末尾的换行符
-                    size_t len = strlen(message);
+                    int len = strlen(message);
                     if (len > 0 && message[len-1] == '\n') {
                         message[len-1] = '\0';
                     }
@@ -314,7 +316,7 @@ int load_keys_and_cert(const char *user_id) {
     }
     fclose(cert_file);
     
-    print_cert_info(&loaded_cert);
+    //print_cert_info(&loaded_cert);
     
     // 加载私钥
     FILE *priv_file = fopen(priv_key_filename, "rb");
@@ -367,7 +369,7 @@ int request_registration(int sock, const char *user_id) {
     
     // 将Ru转换为字节数组以便发送
     unsigned char Ru_bytes[SM2_PUB_MAX_SIZE];
-    size_t ru_len = EC_POINT_point2oct(group, Ru, POINT_CONVERSION_UNCOMPRESSED, 
+    int ru_len = EC_POINT_point2oct(group, Ru, POINT_CONVERSION_UNCOMPRESSED, 
                                      Ru_bytes, SM2_PUB_MAX_SIZE, NULL);
     
     // 准备发送数据：ID + Ru（先ID后Ru）
@@ -447,7 +449,7 @@ int request_registration(int sock, const char *user_id) {
     unsigned char d_u[SM2_PRI_MAX_SIZE];
     calculate_r(d_u, e, Ku, r, order);
     print_hex("用户私钥d_u", d_u, SM2_PRI_MAX_SIZE);
-
+    
     // 验证密钥对
     if(!verify_key_pair_bytes(group, Qu, d_u)){
         printf("密钥对验证失败！\n");
@@ -456,6 +458,10 @@ int request_registration(int sock, const char *user_id) {
         EC_POINT_free(Pu);
         return 0;
     }
+
+    // 更新全局变量
+    memcpy(priv_key, d_u, SM2_PRI_MAX_SIZE);
+    memcpy(pub_key, Qu, SM2_PUB_MAX_SIZE);
     
     // 保存用户私钥供后续使用
     FILE *key_file = fopen(priv_key_filename, "wb");
@@ -503,7 +509,7 @@ int request_cert_update(int sock, const char *user_id) {
     
     // 将Ru转换为字节数组以便发送
     unsigned char Ru_bytes[SM2_PUB_MAX_SIZE];
-    size_t ru_len = EC_POINT_point2oct(group, Ru, POINT_CONVERSION_UNCOMPRESSED, 
+    int ru_len = EC_POINT_point2oct(group, Ru, POINT_CONVERSION_UNCOMPRESSED, 
                                      Ru_bytes, SM2_PUB_MAX_SIZE, NULL);
     
     // 准备要签名的数据：ID + Ru（先ID后Ru）
@@ -562,8 +568,7 @@ int request_cert_update(int sock, const char *user_id) {
     }
     memcpy(&new_cert, buffer, sizeof(ImpCert));
     memcpy(r, buffer + sizeof(ImpCert), SM2_PRI_MAX_SIZE);
-
-    printf("已成功接收更新后的证书和部分私钥r\n");
+    print_hex("新部分私钥r", r, SM2_PRI_MAX_SIZE);
     
     // 保存新证书供后续使用
     char cert_filename[SUBJECT_ID_SIZE + 5] = {0}; // ID + ".crt"
@@ -582,7 +587,7 @@ int request_cert_update(int sock, const char *user_id) {
     
     // 公钥重构 Qu=e×Pu+Q_ca
     unsigned char Qu[SM2_PUB_MAX_SIZE];
-    rec_pubkey(Qu, e, Pu, Q_ca);
+    rec_pubkey(Qu, e, Pu, Q_ca); 
 
     // 计算最终私钥d_u=e×Ku+r (mod n)
     unsigned char d_u[SM2_PRI_MAX_SIZE];
@@ -597,6 +602,10 @@ int request_cert_update(int sock, const char *user_id) {
         return 0;
     }
     
+    // 更新全局变量
+    memcpy(priv_key, d_u, SM2_PRI_MAX_SIZE);
+    memcpy(pub_key, Qu, SM2_PUB_MAX_SIZE);
+
     // 保存用户新私钥供后续使用
     char priv_key_filename[SUBJECT_ID_SIZE + 11] = {0}; // ID + "_priv.key"
     sprintf(priv_key_filename, "%s_priv.key", user_id);
@@ -633,7 +642,7 @@ int request_cert_update(int sock, const char *user_id) {
 
 int send_signed_message(int sock, const char *user_id, const char *message) {
     // 检查消息长度
-    size_t message_len = strlen(message);
+    int message_len = strlen(message);
     if (message_len > MAX_MESSAGE_SIZE) {
         printf("消息过长，最大允许%d字节\n", MAX_MESSAGE_SIZE);
         return 0;
@@ -653,7 +662,7 @@ int send_signed_message(int sock, const char *user_id, const char *message) {
     
     // 准备要发送的数据：消息长度(2字节) + 消息内容 + 签名(64字节) + 证书
     // 总长度：2 + message_len + 64 + sizeof(ImpCert)
-    size_t data_size = 2 + message_len + 64 + sizeof(ImpCert);
+    int data_size = 2 + message_len + 64 + sizeof(ImpCert);
     unsigned char *send_data = (unsigned char *)malloc(data_size);
     if (!send_data) {
         printf("内存分配失败\n");
