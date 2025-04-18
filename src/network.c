@@ -34,10 +34,18 @@ int send_message(int sock, uint8_t cmd, const void *data, uint16_t data_len) {
         memcpy(buffer + MSG_HEADER_SIZE, data, data_len);
     }
     
-    // 发送消息
-    if (send(sock, buffer, data_len + MSG_HEADER_SIZE, 0) < 0) {
-        perror("发送消息失败");
-        return 0;
+    // 发送消息 - 使用循环确保完整发送
+    int total_sent = 0;
+    int bytes_to_send = data_len + MSG_HEADER_SIZE;
+    int bytes_sent = 0;
+    
+    while (total_sent < bytes_to_send) {
+        bytes_sent = send(sock, buffer + total_sent, bytes_to_send - total_sent, 0);
+        if (bytes_sent < 0) {
+            perror("发送消息失败");
+            return 0;
+        }
+        total_sent += bytes_sent;
     }
     
     return 1;

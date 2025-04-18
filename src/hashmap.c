@@ -4,9 +4,9 @@
 #include "hashmap.h"
 #include <time.h>
 // 字符串键的哈希函数
-size_t string_hash(const void* key, size_t size) {
+int string_hash(const void* key, int size) {
     const char* str = (const char*)key;
-    size_t hash = 0;
+    int hash = 0;
     while (*str) {
         hash = (hash * 31 + *str) % size;
         str++;
@@ -20,10 +20,10 @@ bool string_compare(const void* key1, const void* key2) {
 }
 
 // 二进制数据的哈希函数
-size_t binary_hash(const void* key, size_t size) {
+int binary_hash(const void* key, int size) {
     const unsigned char* bytes = (const unsigned char*)key;
-    size_t hash = 0;
-    for (size_t i = 0; i < CERT_HASH_LEN; i++) {
+    int hash = 0;
+    for (int i = 0; i < CERT_HASH_SIZE; i++) {
         hash = (hash * 31 + bytes[i]) % size;
     }
     return hash;
@@ -31,7 +31,7 @@ size_t binary_hash(const void* key, size_t size) {
 
 // 二进制数据的比较函数
 bool binary_compare(const void* key1, const void* key2) {
-    return memcmp(key1, key2, CERT_HASH_LEN) == 0;
+    return memcmp(key1, key2, CERT_HASH_SIZE) == 0;
 }
 
 // 字符串键释放函数
@@ -50,8 +50,8 @@ void null_free(void* ptr) {
 }
 
 // 创建通用哈希表
-hashmap* hashmap_create(size_t size, 
-                      size_t (*hash_func)(const void* key, size_t size),
+hashmap* hashmap_create(int size, 
+                      int (*hash_func)(const void* key, int size),
                       bool (*key_compare)(const void* key1, const void* key2),
                       void (*key_free)(void* key),
                       void (*value_free)(void* value)) {
@@ -78,7 +78,7 @@ void hashmap_destroy(hashmap* map) {
     if (!map) return;
     
     // 释放所有节点内存
-    for (size_t i = 0; i < map->size; i++) {
+    for (int i = 0; i < map->size; i++) {
         hashmap_entry* entry = map->entries[i];
         while (entry) {
             hashmap_entry* next = entry->next;
@@ -98,7 +98,7 @@ void hashmap_destroy(hashmap* map) {
 bool hashmap_exists(hashmap* map, const void* key) {
     if (!map || !key) return false;
     
-    size_t index = map->hash_func(key, map->size);
+    int index = map->hash_func(key, map->size);
     hashmap_entry* entry = map->entries[index];
     
     while (entry) {
@@ -114,7 +114,7 @@ bool hashmap_exists(hashmap* map, const void* key) {
 void* hashmap_get(hashmap* map, const void* key) {
     if (!map || !key) return NULL;
     
-    size_t index = map->hash_func(key, map->size);
+    int index = map->hash_func(key, map->size);
     hashmap_entry* entry = map->entries[index];
     
     while (entry) {
@@ -127,10 +127,10 @@ void* hashmap_get(hashmap* map, const void* key) {
     return NULL;
 }
 
-bool hashmap_put(hashmap* map, void* key, void* value, size_t value_size) {
+bool hashmap_put(hashmap* map, void* key, void* value, int value_size) {
     if (!map || !key) return false;
     
-    size_t index = map->hash_func(key, map->size);
+    int index = map->hash_func(key, map->size);
     hashmap_entry* entry = map->entries[index];
     hashmap_entry* prev = NULL;
     
@@ -195,7 +195,7 @@ bool hashmap_put(hashmap* map, void* key, void* value, size_t value_size) {
 bool hashmap_remove(hashmap* map, const void* key) {
     if (!map || !key) return false;
     
-    size_t index = map->hash_func(key, map->size);
+    int index = map->hash_func(key, map->size);
     hashmap_entry* entry = map->entries[index];
     hashmap_entry* prev = NULL;
     
@@ -224,77 +224,106 @@ bool hashmap_remove(hashmap* map, const void* key) {
 // ======= 用户列表特定函数 =======
 
 // 创建用户列表哈希表
-hashmap* ul_hashmap_create(size_t size) {
+hashmap* ul_hashmap_create(int size) {
     return hashmap_create(size, string_hash, string_compare, string_key_free, binary_value_free);
 }
 
-// 从文件加载用户列表哈希表
-hashmap* ul_hashmap_load(const char* filename, size_t size) {
-    FILE* file = fopen(filename, "r");
-    hashmap* map = ul_hashmap_create(size);
-    
-    if (!map) {
-        if (file) fclose(file);
-        return NULL;
-    }
-    
+// 从二进制文件加载用户列表哈希表
+hashmap* ul_hashmap_load(const char* filename) {
+    FILE* file = fopen(filename, "rb");
     if (!file) {
-        return map; // 返回空哈希表
+        // 文件不存在，创建一个新的哈希表
+        return ul_hashmap_create(256); // 默认大小256
     }
     
-    char line[256];
-    char key[9]; // 8字符ID + 结束符
-    unsigned char* value = malloc(CERT_HASH_LEN);
+    // 读取哈希表大小
+    int size;
+    if (fread(&size, sizeof(int), 1, file) != 1) {
+        fclose(file);
+        return ul_hashmap_create(256); // 读取失败，使用默认大小
+    }
     
-    if (!value) {
-        hashmap_destroy(map);
+    // 读取条目数量
+    int count;
+    if (fread(&count, sizeof(int), 1, file) != 1) {
+        fclose(file);
+        return ul_hashmap_create(256); // 读取失败，使用默认大小
+    }
+    
+    // 创建哈希表
+    hashmap* map = ul_hashmap_create(size);
+    if (!map) {
         fclose(file);
         return NULL;
     }
     
-    while (fgets(line, sizeof(line), file)) {
-        // 格式：ID + 空格 + 64位十六进制哈希值
-        if (strlen(line) < 10) continue; // 至少要有ID(8) + 空格(1) + 部分哈希
+    // 读取所有条目
+    for (int i = 0; i < count; i++) {
+        // 读取键（用户ID，固定8字符）
+        char* key = malloc(SUBJECT_ID_SIZE); // 8字符+结束符
+        if (!key) break;
         
-        // 提取用户ID
-        strncpy(key, line, 8);
-        key[8] = '\0';
+        if (fread(key, 1, SUBJECT_ID_LEN, file) != SUBJECT_ID_LEN) {
+            free(key);
+            break;
+        }
+        key[SUBJECT_ID_LEN] = '\0'; // 确保字符串结束
         
-        // 提取哈希值（十六进制转二进制）
-        char* hash_str = line + 9; // 跳过ID和空格
-        for (int i = 0; i < CERT_HASH_LEN; i++) {
-            sscanf(hash_str + i*2, "%2hhx", &value[i]);
+        // 读取值（证书哈希）
+        unsigned char* value = malloc(CERT_HASH_SIZE);
+        if (!value) {
+            free(key);
+            break;
+        }
+        
+        if (fread(value, 1, CERT_HASH_SIZE, file) != CERT_HASH_SIZE) {
+            free(key);
+            free(value);
+            break;
         }
         
         // 添加到哈希表
-        hashmap_put(map, strdup(key), value, CERT_HASH_LEN);
+        hashmap_put(map, key, value, CERT_HASH_SIZE);
     }
     
-    free(value); // 释放临时缓冲区
     fclose(file);
     return map;
 }
 
-// 保存用户列表哈希表到文件
+// 保存用户列表哈希表到二进制文件
 bool ul_hashmap_save(hashmap* map, const char* filename) {
     if (!map || !filename) return false;
     
-    FILE* file = fopen(filename, "w");
+    FILE* file = fopen(filename, "wb");
     if (!file) return false;
     
-    // 遍历哈希表
-    for (size_t i = 0; i < map->size; i++) {
+    // 写入哈希表大小
+    if (fwrite(&map->size, sizeof(int), 1, file) != 1) {
+        fclose(file);
+        return false;
+    }
+    
+    // 写入条目数量
+    if (fwrite(&map->count, sizeof(int), 1, file) != 1) {
+        fclose(file);
+        return false;
+    }
+    
+    // 遍历哈希表写入所有条目
+    for (int i = 0; i < map->size; i++) {
         hashmap_entry* entry = map->entries[i];
         while (entry) {
-            // 写入ID
-            fprintf(file, "%s ", (char*)entry->key);
-            
-            // 写入哈希值（二进制转十六进制）
-            unsigned char* value = (unsigned char*)entry->value;
-            for (int j = 0; j < CERT_HASH_LEN; j++) {
-                fprintf(file, "%02x", value[j]);
+            // 写入键（用户ID，固定8字符）
+            if (fwrite(entry->key, 1, SUBJECT_ID_LEN, file) != SUBJECT_ID_LEN) {
+                fclose(file);
+                return false;
             }
-            fprintf(file, "\n");
+            
+            // 写入值（证书哈希）
+            if (fwrite(entry->value, 1, CERT_HASH_SIZE, file) != CERT_HASH_SIZE) {
+                fclose(file);
+                return false;
+            }
             
             entry = entry->next;
         }
@@ -307,94 +336,111 @@ bool ul_hashmap_save(hashmap* map, const char* filename) {
 // ======= CRL特定函数 =======
 
 // 创建CRL哈希表
-hashmap* crl_hashmap_create(size_t size) {
+hashmap* crl_hashmap_create(int size) {
     // CRL中键是证书哈希，值为到期时间
     return hashmap_create(size, binary_hash, binary_compare, free, free);
 }
 
-hashmap* crl_hashmap_load(const char* filename, size_t size) {
-    FILE* file = fopen(filename, "r");
-    hashmap* map = crl_hashmap_create(size);
+// 从二进制文件加载CRL哈希表
+hashmap* crl_hashmap_load(const char* filename) {
+    FILE* file = fopen(filename, "rb");
+    if (!file) {
+        // 文件不存在，创建一个新的哈希表
+        return crl_hashmap_create(512); // 默认大小512
+    }
     
+    // 读取哈希表大小
+    int size;
+    if (fread(&size, sizeof(int), 1, file) != 1) {
+        fclose(file);
+        return crl_hashmap_create(512); // 读取失败，使用默认大小
+    }
+    
+    // 读取条目数量
+    int count;
+    if (fread(&count, sizeof(int), 1, file) != 1) {
+        fclose(file);
+        return crl_hashmap_create(512); // 读取失败，使用默认大小
+    }
+    
+    // 创建哈希表
+    hashmap* map = crl_hashmap_create(size);
     if (!map) {
-        if (file) fclose(file);
+        fclose(file);
         return NULL;
     }
     
-    if (!file) {
-        return map; // 返回空哈希表
-    }
-    
-    char line[256];
-    char next_line[256];
-    
-    while (fgets(line, sizeof(line), file)) {
-        // 移除可能的尾部换行符
-        char* newline = strchr(line, '\n');
-        if (newline) *newline = '\0';
+    // 读取所有条目
+    for (int i = 0; i < count; i++) {
+        // 读取键（证书哈希）
+        unsigned char* cert_hash = malloc(CERT_HASH_SIZE);
+        if (!cert_hash) break;
         
-        // 每行应该是64个十六进制字符（32字节的哈希值）
-        if (strlen(line) != 64) continue;
-        
-        // 读取下一行，获取到期时间
-        time_t expire_time = 0;
-        if (fgets(next_line, sizeof(next_line), file)) {
-            // 移除可能的尾部换行符
-            newline = strchr(next_line, '\n');
-            if (newline) *newline = '\0';
-            
-            // 将字符串转换为时间戳
-            sscanf(next_line, "%ld", &expire_time);
-        }
-        
-        // 将十六进制字符串转换为二进制哈希值
-        unsigned char* cert_hash = malloc(CERT_HASH_LEN);
-        if (!cert_hash) continue;
-        
-        for (int i = 0; i < CERT_HASH_LEN; i++) {
-            sscanf(&line[i*2], "%2hhx", &cert_hash[i]);
-        }
-        
-        // 分配存储到期时间的内存
-        time_t* expire_time_ptr = malloc(sizeof(time_t));
-        if (!expire_time_ptr) {
+        if (fread(cert_hash, 1, CERT_HASH_SIZE, file) != CERT_HASH_SIZE) {
             free(cert_hash);
-            continue;
+            break;
         }
         
-        *expire_time_ptr = expire_time;
+        // 读取值（到期时间）
+        time_t* expire_time = malloc(sizeof(time_t));
+        if (!expire_time) {
+            free(cert_hash);
+            break;
+        }
         
-        // 添加到哈希表，值为到期时间
-        hashmap_put(map, cert_hash, expire_time_ptr, sizeof(time_t));
+        if (fread(expire_time, sizeof(time_t), 1, file) != 1) {
+            free(cert_hash);
+            free(expire_time);
+            break;
+        }
+        
+        // 添加到哈希表
+        hashmap_put(map, cert_hash, expire_time, sizeof(time_t));
     }
     
     fclose(file);
     return map;
 }
 
+// 保存CRL哈希表到二进制文件
 bool crl_hashmap_save(hashmap* map, const char* filename) {
     if (!map || !filename) return false;
     
-    FILE* file = fopen(filename, "w");
+    FILE* file = fopen(filename, "wb");
     if (!file) return false;
     
-    // 遍历哈希表
-    for (size_t i = 0; i < map->size; i++) {
+    // 写入哈希表大小
+    if (fwrite(&map->size, sizeof(int), 1, file) != 1) {
+        fclose(file);
+        return false;
+    }
+    
+    // 写入条目数量
+    if (fwrite(&map->count, sizeof(int), 1, file) != 1) {
+        fclose(file);
+        return false;
+    }
+    
+    // 遍历哈希表写入所有条目
+    for (int i = 0; i < map->size; i++) {
         hashmap_entry* entry = map->entries[i];
         while (entry) {
-            // 将哈希值转换为十六进制字符串并写入
-            unsigned char* hash = (unsigned char*)entry->key;
-            for (int j = 0; j < CERT_HASH_LEN; j++) {
-                fprintf(file, "%02x", hash[j]);
+            // 写入键（证书哈希）
+            if (fwrite(entry->key, 1, CERT_HASH_SIZE, file) != CERT_HASH_SIZE) {
+                fclose(file);
+                return false;
             }
-            fprintf(file, "\n");
             
-            // 写入到期时间
+            // 写入值（到期时间）
             time_t expire_time = 0;
             if (entry->value) {
                 expire_time = *((time_t*)entry->value);
             }
-            fprintf(file, "%ld\n", expire_time);
+            
+            if (fwrite(&expire_time, sizeof(time_t), 1, file) != 1) {
+                fclose(file);
+                return false;
+            }
             
             entry = entry->next;
         }

@@ -8,10 +8,10 @@ ca_server_dir="$SCRIPT_DIR/server/ca-server"
 user_client_dir="$SCRIPT_DIR/server/user-client"
 
 # 定义ca-server目录的白名单文件列表
-ca_server_whitelist=("UserCerts" "UserData" "ca" "ca_priv.key" "ca_pub.key" "ca.c" "UserList.txt" "CRL.txt"  "SerialNum.txt")
+ca_server_whitelist=("UserCerts" "UserData" "ca" "ca_priv.key" "ca_pub.key" "ca.c" "SerialNum.txt")
 
 # 定义user-client目录的白名单文件列表
-user_client_whitelist=("user" "user.c" "ca_pub.key" "ca.crt" "cost.c" "cost")
+user_client_whitelist=("user" "user.c" "ca_pub.key" "auto_update.c" "ca.crt")
 
 # 删除ca-server目录中不需要的文件
 cd "$ca_server_dir" || { echo "无法进入目录 $ca_server_dir"; exit 1; }
@@ -36,20 +36,6 @@ if [ -d "$ca_server_dir/UserData" ]; then
   echo "UserData 目录中的文件已清空"
 else
   echo "警告: UserData 目录不存在"
-fi
-
-# 清空UserList.txt文件内容
-if [ -f "$ca_server_dir/UserList.txt" ]; then
-  > "$ca_server_dir/UserList.txt"
-else
-  echo "警告: UserList.txt 文件不存在"
-fi
-
-# 清空CRL.txt文件内容
-if [ -f "$ca_server_dir/CRL.txt" ]; then
-  > "$ca_server_dir/CRL.txt"
-else
-  echo "警告: CRL.txt 文件不存在"
 fi
 
 # 将SerialNum.txt内容置为1

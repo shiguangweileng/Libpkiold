@@ -13,10 +13,10 @@
 #include "crlmanager.h"
 #include "network.h"
 
-#define CRL_FILE "CRL.txt"               // 撤销列表文件
+#define CRL_FILE "CRL.dat"               // 撤销列表文件
 #define USERDATA_DIR "UserData"          // 本地模式下存储用户数据的目录
 #define USERCERTS_DIR "UserCerts"        // 存储用户证书的目录
-#define USERLIST_FILE "UserList.txt"     // 用户列表文件
+#define USERLIST_FILE "UserList.dat"     // 用户列表文件
 #define SERIAL_NUM_FILE "SerialNum.txt"  // 序列号持久化文件
 #define CRL_MANAGER_FILE "CRLManager.dat" // CRL管理器文件
 
@@ -99,16 +99,16 @@ int main() {
     
     current_serial_num = load_serial_num();
     
-    // 加载用户列表到哈希表中，初始大小为256
-    user_map = ul_hashmap_load(USERLIST_FILE, 256);
+    // 加载用户列表到哈希表中
+    user_map = ul_hashmap_load(USERLIST_FILE);
     if (!user_map) {
         printf("无法初始化用户哈希表！\n");
         sm2_params_cleanup();
         return -1;
     }
 
-    // 加载证书撤销列表到哈希表中，初始大小为512
-    crl_map = crl_hashmap_load(CRL_FILE, 512);
+    // 加载证书撤销列表到哈希表中
+    crl_map = crl_hashmap_load(CRL_FILE);
     if (!crl_map) {
         printf("无法初始化CRL哈希表！\n");
         hashmap_destroy(user_map);
@@ -391,6 +391,7 @@ void handle_cert_update(int client_socket, const unsigned char *buffer, int data
         EC_POINT_free(Pu);
         return;
     }
+    //print_hex("重构用户公钥Qu", Qu, SM2_PUB_MAX_SIZE);
     
     // 提取签名数据和签名
     unsigned char sign_data[SUBJECT_ID_SIZE + SM2_PUB_MAX_SIZE];
@@ -459,7 +460,7 @@ void handle_cert_update(int client_socket, const unsigned char *buffer, int data
         printf("警告：无法将旧证书添加到CRL管理器\n");
     }
     
-    // 更新用户信息到UserList.txt
+    // 更新用户信息到UserList.dat
     if (!update_user_list(subject_id, new_cert_hash)) {
         printf("更新用户数据失败！\n");
     }
@@ -1181,11 +1182,11 @@ int check_user_exists(const char *subject_id) {
 }
 
 int save_user_list(const char *subject_id, const unsigned char *cert_hash) {
-    return hashmap_put(user_map, strdup(subject_id), (void*)cert_hash, CERT_HASH_LEN) ? 1 : 0;
+    return hashmap_put(user_map, strdup(subject_id), (void*)cert_hash, CERT_HASH_SIZE) ? 1 : 0;
 }
 
 int update_user_list(const char *subject_id, const unsigned char *new_cert_hash) {
-    return hashmap_put(user_map, strdup(subject_id), (void*)new_cert_hash, CERT_HASH_LEN) ? 1 : 0;
+    return hashmap_put(user_map, strdup(subject_id), (void*)new_cert_hash, CERT_HASH_SIZE) ? 1 : 0;
 }
 
 int delete_user_from_list(const char *subject_id) {
@@ -1205,10 +1206,10 @@ int check_cert_in_crl(const unsigned char *cert_hash) {
 }
 
 int add_cert_to_crl(const unsigned char *cert_hash, time_t expire_time) {
-    unsigned char* cert_hash_copy = malloc(CERT_HASH_LEN);
+    unsigned char* cert_hash_copy = malloc(CERT_HASH_SIZE);
     if (!cert_hash_copy) return 0;
     
-    memcpy(cert_hash_copy, cert_hash, CERT_HASH_LEN);
+    memcpy(cert_hash_copy, cert_hash, CERT_HASH_SIZE);
     
     // 分配存储到期时间的内存
     time_t* expire_time_copy = malloc(sizeof(time_t));
