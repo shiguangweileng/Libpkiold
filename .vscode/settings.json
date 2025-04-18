@@ -5,6 +5,8 @@
     "makefile.configureOnOpen": false,
     "files.associations": {
         "*.json": "json",
-        "stdio.h": "c"
+        "stdio.h": "c",
+        "imp_cert.h": "c",
+        "gm_crypto.h": "c"
     }
 }

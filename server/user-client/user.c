@@ -2,50 +2,25 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <arpa/inet.h>
-#include <sys/socket.h>
-#include <openssl/ec.h>
 #include <sys/time.h>
 #include "common.h"
 #include "gm_crypto.h"
 #include "imp_cert.h"
 #include "hashmap.h"
 #include "crlmanager.h"
-
-#define PORT 8000
-#define BUFFER_SIZE 8192
+#include "network.h"
 
 #define CRL_MANAGER_FILE "CRLManager.dat"
-// 通信协议常量
-#define CMD_SEND_ID_AND_RU    0x01    // 用户发送ID和Ru
-#define CMD_SEND_CERT_AND_R   0x02    // CA发送证书和部分私钥r
-#define CMD_REQUEST_UPDATE    0x03    // 用户请求更新证书
-#define CMD_SEND_UPDATED_CERT 0x04    // CA发送更新后的证书
-#define CMD_SEND_MESSAGE      0x05    // 用户发送消息、签名和证书
-#define CMD_VERIFY_CERT       0x06    // 用户查询证书有效性
-#define CMD_CERT_STATUS       0x07    // CA返回证书状态
-#define CMD_REQUEST_REVOKE    0x08    // 用户请求撤销证书
-#define CMD_REVOKE_RESPONSE   0x09    // CA返回撤销结果
-#define CMD_REQUEST_CRL_UPDATE 0x0A   // 用户请求CRL增量更新
-#define CMD_SEND_CRL_UPDATE   0x0B    // CA发送CRL增量更新
-
-// 消息头部结构: 命令(1字节) + 数据长度(2字节)
-#define MSG_HEADER_SIZE 3
-#define SUBJECT_ID_LEN 8     // 主体ID实际长度
-#define SUBJECT_ID_SIZE 9    // 主体ID存储长度
 #define MAX_MESSAGE_SIZE 1024 // 最大消息长度
-#define CERT_HASH_SIZE 32    // 证书哈希值长度
 
 // 存储相关信息的全局变量
 ImpCert loaded_cert;
-hashmap* local_crl = NULL;  // 新增local_crl哈希表，只存储证书哈希值
+hashmap* local_crl = NULL;                  // 本地CRL哈希表，只存储证书哈希值
 CRLManager* crl_manager = NULL;
 unsigned char priv_key[SM2_PRI_MAX_SIZE];
 unsigned char pub_key[SM2_PUB_MAX_SIZE];
 unsigned char Q_ca[SM2_PUB_MAX_SIZE];
 int has_cert = 0;
-
-//----------------函数声明-------------------
 
 // CRL相关函数
 int init_crl_manager();
@@ -56,18 +31,12 @@ int online_csp(int sock, const unsigned char *cert_hash);
 int local_csp(const unsigned char *cert_hash);
 
 // 用户操作
-int check_and_load_cert(const char *user_id);
+int load_keys_and_cert(const char *user_id);
 int request_registration(int sock, const char *user_id);
 int request_cert_update(int sock, const char *user_id);
-int send_signed_message(int sock, const char *user_id, const char *message);
 int request_cert_revoke(int sock, const char *user_id);
+int send_signed_message(int sock, const char *user_id, const char *message);
 
-// 网络通信函数
-int send_message(int sock, uint8_t cmd, const void *data, uint16_t data_len);
-int recv_message(int sock, uint8_t *cmd, void *data, uint16_t max_len);
-int connect_to_server(const char *ip, int port);
-
-//----------------主函数-------------------
 int main() {
     char server_ip[16] = {0};
     char user_id[SUBJECT_ID_SIZE] = {0};
@@ -119,7 +88,7 @@ int main() {
         }
         
         // 检查本地是否存在该ID的证书
-        has_cert = check_and_load_cert(user_id);
+        has_cert = load_keys_and_cert(user_id);
         
         // 内层循环 - 处理当前用户的多次操作
         int user_session = 1;
@@ -134,7 +103,6 @@ int main() {
             printf("6. 同步CRL\n");
             printf("7. 证书状态比对(在线+本地)\n");
             printf("8. 切换用户\n");
-            printf("0. 退出程序\n");
 
             printf("请输入选择: ");
             if (scanf("%d", &choice) != 1) {
@@ -143,12 +111,8 @@ int main() {
                 continue;
             }
             
-            // 检查是否要退出程序
-            if (choice == 0) {
-                user_session = 0;
-                running = 0;
-                continue;
-            } else if (choice == 8) {
+            // 检查是否要切换用户
+            if (choice == 8) {
                 user_session = 0; // 退出当前用户会话，返回到用户ID输入
                 continue;
             }
@@ -159,10 +123,7 @@ int main() {
                 printf("无法连接到服务器 %s，请检查网络或服务器状态\n", server_ip);
                 continue;
             }
-            
-            // 根据用户选择执行相应操作
             result = 0;
-            
             switch (choice) {
                 case 1:
                     gettimeofday(&start_time, NULL); // 记录开始时间
@@ -282,10 +243,7 @@ int main() {
                     result = 0;
                     break;
             }
-
-            // 关闭连接
             close(sock);
-            
             if (result) {
                 gettimeofday(&end_time, NULL);
                 long seconds = end_time.tv_sec - start_time.tv_sec;
@@ -295,11 +253,11 @@ int main() {
                 if (choice == 1) {
                     printf("注册证书的时间开销: %.2f ms\n", elapsed_ms);
                     // 操作完成后重新加载证书
-                    has_cert = check_and_load_cert(user_id);
+                    has_cert = load_keys_and_cert(user_id);
                 } else if (choice == 2) {
                     printf("更新证书的时间开销: %.2f ms\n", elapsed_ms);
                     // 更新后重新加载证书
-                    has_cert = check_and_load_cert(user_id);
+                    has_cert = load_keys_and_cert(user_id);
                 } else if (choice == 3) {
                     printf("发送消息的时间开销: %.2f ms\n", elapsed_ms);
                 } else if (choice == 4) {
@@ -327,13 +285,12 @@ int main() {
     if (local_crl) {
         hashmap_destroy(local_crl);
     }
-    
     sm2_params_cleanup();
     return 0;
 }
 
 //----------------证书处理函数实现-------------------
-int check_and_load_cert(const char *user_id) {
+int load_keys_and_cert(const char *user_id) {
     char cert_filename[SUBJECT_ID_SIZE + 5] = {0}; // ID + ".crt"
     char priv_key_filename[SUBJECT_ID_SIZE + 11] = {0}; // ID + "_priv.key"
     char pub_key_filename[SUBJECT_ID_SIZE + 10] = {0}; // ID + "_pub.key"
@@ -904,99 +861,6 @@ int request_cert_revoke(int sock, const char *user_id) {
     return 1;
 }
 
-//----------------网络通信函数实现-------------------
-int send_message(int sock, uint8_t cmd, const void *data, uint16_t data_len) {
-    if (data_len + MSG_HEADER_SIZE > BUFFER_SIZE) {
-        printf("错误：消息长度超出缓冲区大小\n");
-        return 0;
-    }
-    
-    unsigned char buffer[BUFFER_SIZE] = {0};
-    
-    // 填充消息头
-    buffer[0] = cmd;
-    buffer[1] = (data_len >> 8) & 0xFF;  // 高字节
-    buffer[2] = data_len & 0xFF;         // 低字节
-    
-    // 复制数据
-    if (data && data_len > 0) {
-        memcpy(buffer + MSG_HEADER_SIZE, data, data_len);
-    }
-    
-    // 发送消息
-    if (send(sock, buffer, data_len + MSG_HEADER_SIZE, 0) < 0) {
-        perror("发送消息失败");
-        return 0;
-    }
-    
-    return 1;
-}
-
-int recv_message(int sock, uint8_t *cmd, void *data, uint16_t max_len) {
-    unsigned char header[MSG_HEADER_SIZE] = {0};
-    
-    // 接收消息头
-    if (recv(sock, header, MSG_HEADER_SIZE, 0) != MSG_HEADER_SIZE) {
-        perror("接收消息头失败");
-        return -1;
-    }
-    
-    // 解析消息头
-    *cmd = header[0];
-    uint16_t data_len = (header[1] << 8) | header[2];
-    
-    if (data_len > max_len) {
-        printf("错误：接收的数据长度(%d)超出缓冲区大小(%d)\n", data_len, max_len);
-        return -1;
-    }
-    
-    // 接收消息体
-    if (data_len > 0) {
-        int received = 0;
-        int total = 0;
-        
-        while (total < data_len) {
-            received = recv(sock, (unsigned char*)data + total, data_len - total, 0);
-            if (received <= 0) {
-                perror("接收消息体失败");
-                return -1;
-            }
-            total += received;
-        }
-    }
-    
-    return data_len;
-}
-
-int connect_to_server(const char *ip, int port) {
-    int sock = 0;
-    struct sockaddr_in serv_addr;
-    
-    // 创建socket
-    if ((sock = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
-        perror("Socket创建失败");
-        return -1;
-    }
-    
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_port = htons(port);
-    
-    // 将IP地址从文本转换为二进制形式
-    if (inet_pton(AF_INET, ip, &serv_addr.sin_addr) <= 0) {
-        perror("无效的地址");
-        close(sock);
-        return -1;
-    }
-    
-    // 连接到服务器
-    if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
-        perror("连接失败");
-        close(sock);
-        return -1;
-    }
-    return sock;
-}
-
 //----------------CRL相关函数实现-------------------
 int init_crl_manager() {
     // 初始化local_crl哈希表，初始大小为512
@@ -1174,7 +1038,5 @@ int sync_crl_with_ca(int sock) {
 
 // 本地证书状态检查
 int local_csp(const unsigned char *cert_hash) {
-    // 如果证书在CRL中存在，表示已撤销，返回0表示无效
-    // 如果不在CRL中，表示有效，返回1
     return !check_cert_in_local_crl(cert_hash);
 }

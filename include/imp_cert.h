@@ -4,9 +4,13 @@
 #include <time.h>
 #include "common.h"
 
-/**
- * 隐式证书结构
- */
+
+#define SERIAL_NUM_FORMAT "SN%06d"       // 序列号格式，6位数字前缀为SN
+#define SERIAL_NUM_MAX 999999            // 序列号最大值
+#define SUBJECT_ID_LEN 8     // 主体ID实际长度
+#define SUBJECT_ID_SIZE 9    // 主体ID长度为9字节
+#define CERT_HASH_SIZE 32    // 证书哈希值长度
+
 typedef struct {
     unsigned char SerialNum[9];  // 证书序列号
     unsigned char IssuerID[9];   // 颁发者ID

@@ -2,44 +2,23 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include <arpa/inet.h>
-#include <sys/socket.h>
-#include <sys/stat.h>
 #include <pthread.h>
+#include <sys/stat.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
 #include "common.h"
 #include "gm_crypto.h"
 #include "imp_cert.h"
 #include "hashmap.h"
 #include "crlmanager.h"
+#include "network.h"
 
-#define PORT 8000
-#define BUFFER_SIZE 2048
-#define CRL_FILE "CRL.txt"
+#define CRL_FILE "CRL.txt"               // 撤销列表文件
 #define USERDATA_DIR "UserData"          // 本地模式下存储用户数据的目录
 #define USERCERTS_DIR "UserCerts"        // 存储用户证书的目录
 #define USERLIST_FILE "UserList.txt"     // 用户列表文件
 #define SERIAL_NUM_FILE "SerialNum.txt"  // 序列号持久化文件
 #define CRL_MANAGER_FILE "CRLManager.dat" // CRL管理器文件
-#define SERIAL_NUM_FORMAT "SN%06d"       // 序列号格式，6位数字前缀为SN
-#define SERIAL_NUM_MAX 999999            // 序列号最大值
-// 通信协议常量
-#define CMD_SEND_ID_AND_RU    0x01    // 用户发送ID和Ru
-#define CMD_SEND_CERT_AND_R   0x02    // CA发送证书和部分私钥r
-#define CMD_REQUEST_UPDATE    0x03    // 用户请求更新证书
-#define CMD_SEND_UPDATED_CERT 0x04    // CA发送更新后的证书
-#define CMD_SEND_MESSAGE      0x05    // 用户发送消息、签名和证书
-#define CMD_VERIFY_CERT       0x06    // 用户查询证书有效性
-#define CMD_CERT_STATUS       0x07    // CA返回证书状态
-#define CMD_REQUEST_REVOKE    0x08    // 用户请求撤销证书
-#define CMD_REVOKE_RESPONSE   0x09    // CA返回撤销结果
-#define CMD_REQUEST_CRL_UPDATE 0x0A   // 用户请求CRL增量更新
-#define CMD_SEND_CRL_UPDATE   0x0B    // CA发送CRL增量更新
-
-// 消息头部结构: 命令(1字节) + 长度(2字节)
-#define MSG_HEADER_SIZE 3
-#define SUBJECT_ID_LEN 8     // 主体ID实际长度
-#define SUBJECT_ID_SIZE 9    // 主体ID长度为9字节
-#define CERT_HASH_SIZE 32    // 证书哈希值长度
 
 unsigned char d_ca[SM2_PRI_MAX_SIZE];
 unsigned char Q_ca[SM2_PUB_MAX_SIZE];
@@ -54,9 +33,6 @@ pthread_t server_thread;           // 服务器监听线程
 volatile int server_running = 0;   // 服务器运行状态标志
 
 // 网络通信
-int send_message(int sock, uint8_t cmd, const void *data, uint16_t data_len);
-int recv_message(int sock, uint8_t *cmd, void *data, uint16_t max_len);
-int setup_server(int port);
 void handle_client(int client_socket);
 void* server_thread_func(void* arg); // 服务器监听线程函数
 
@@ -109,7 +85,6 @@ int ensure_directory_exists(const char *dir_path) {
 int main() {
     int mode_choice = 0;
     
-    // 初始化CA
     if(!CA_init(Q_ca, d_ca)){
         printf("CA初始化失败！\n");
         return -1;
@@ -122,7 +97,6 @@ int main() {
         return -1;
     }
     
-    // 加载证书序列号
     current_serial_num = load_serial_num();
     
     // 加载用户列表到哈希表中，初始大小为256
@@ -155,8 +129,6 @@ int main() {
             return -1;
         }
     }
-
-    printf("CA服务器初始化完成...\n\n");
     
     // 选择运行模式
     printf("请选择CA服务器运行模式:\n");
@@ -198,99 +170,6 @@ int main() {
 // ============ 函数实现部分，按功能分组 ============
 
 // ---- 网络通信相关函数 ----
-int send_message(int sock, uint8_t cmd, const void *data, uint16_t data_len)
-{
-    if (data_len + MSG_HEADER_SIZE > BUFFER_SIZE) {
-        printf("错误：消息长度超出缓冲区大小\n");
-        return 0;
-    }
-    
-    unsigned char buffer[BUFFER_SIZE] = {0};
-    // 填充消息头
-    buffer[0] = cmd;
-    buffer[1] = (data_len >> 8) & 0xFF;  // 高字节
-    buffer[2] = data_len & 0xFF;         // 低字节
-    
-    // 复制数据
-    if (data && data_len > 0) {
-        memcpy(buffer + MSG_HEADER_SIZE, data, data_len);
-    }
-    
-    // 发送消息
-    if (send(sock, buffer, data_len + MSG_HEADER_SIZE, 0) < 0) {
-        perror("发送消息失败");
-        return 0;
-    }
-    return 1;
-}
-
-int recv_message(int sock, uint8_t *cmd, void *data, uint16_t max_len) {
-    unsigned char header[MSG_HEADER_SIZE] = {0};
-    // 接收消息头
-    if (recv(sock, header, MSG_HEADER_SIZE, 0) != MSG_HEADER_SIZE) {
-        perror("接收消息头失败");
-        return -1;
-    }
-    // 解析消息头
-    *cmd = header[0];
-    uint16_t data_len = (header[1] << 8) | header[2];
-    if (data_len > max_len) {
-        printf("错误：接收的数据长度(%d)超出缓冲区大小(%d)\n", data_len, max_len);
-        return -1;
-    }
-    // 接收消息体
-    if (data_len > 0) {
-        int received = 0;
-        int total = 0;
-        while (total < data_len) {
-            received = recv(sock, (unsigned char*)data + total, data_len - total, 0);
-            if (received <= 0) {
-                perror("接收消息体失败");
-                return -1;
-            }
-            total += received;
-        }
-    }
-    return data_len;
-}
-
-int setup_server(int port) {
-    int server_fd;
-    struct sockaddr_in address;
-    
-    // 创建socket
-    if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) < 0) {
-        perror("Socket创建失败");
-        return -1;
-    }
-    
-    // 设置socket选项
-    int opt = 1;
-    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt))) {
-        perror("设置socket选项失败");
-        close(server_fd);
-        return -1;
-    }
-    
-    // 绑定地址和端口
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = INADDR_ANY;
-    address.sin_port = htons(port);
-    
-    if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
-        perror("绑定失败");
-        close(server_fd);
-        return -1;
-    }
-    
-    // 开始监听
-    if (listen(server_fd, 30) < 0) {
-        perror("监听失败");
-        close(server_fd);
-        return -1;
-    }
-    return server_fd;
-}
 
 void handle_client(int client_socket) {
     unsigned char buffer[BUFFER_SIZE] = {0};
@@ -339,8 +218,7 @@ void handle_registration(int client_socket, const unsigned char *buffer, int dat
     // 先提取用户ID（前8个字节）
     char subject_id[SUBJECT_ID_SIZE] = {0}; // 确保null结尾
     memcpy(subject_id, buffer, SUBJECT_ID_LEN);
-    
-    // 检查ID长度是否为8个字符
+
     if (strlen(subject_id) != 8) {
         printf("用户ID长度错误，必须为8个字符\n");
         return;
@@ -417,8 +295,6 @@ void handle_registration(int client_socket, const unsigned char *buffer, int dat
         return;
     }
     
-    printf("用户 '%s' 成功注册并保存到UserList\n", subject_id);
-
     // 计算部分私钥r=e×k+d_ca (mod n)
     unsigned char r[SM2_PRI_MAX_SIZE];
     calculate_r(r, cert_hash, k, d_ca, order);
@@ -431,11 +307,10 @@ void handle_registration(int client_socket, const unsigned char *buffer, int dat
     
     // 发送证书和部分私钥r给客户端
     if (send_message(client_socket, CMD_SEND_CERT_AND_R, response, sizeof(response))) {
-        printf("已成功发送证书和部分私钥r给用户\n");
+        printf("用户 '%s' 成功注册并保存到UserList\n", subject_id);
         printf("--------------------------------\n");
     }
-    else
-    {
+    else{
         printf("发送证书和部分私钥失败\n");
     }
     // 释放资源
@@ -590,9 +465,7 @@ void handle_cert_update(int client_socket, const unsigned char *buffer, int data
     }
 
     // 保存新证书到文件系统，覆盖现有文件
-    if (save_cert(&new_cert, cert_filename)) {
-        printf("新用户证书已保存为 %s\n", cert_filename);
-    } else {
+    if (!save_cert(&new_cert, cert_filename)) {
         printf("警告：无法保存新用户证书到文件\n");
     }
 
@@ -608,7 +481,7 @@ void handle_cert_update(int client_socket, const unsigned char *buffer, int data
     
     // 发送新证书和部分私钥r给客户端
     if (send_message(client_socket, CMD_SEND_UPDATED_CERT, response, sizeof(response))) {
-        printf("已成功发送新证书和部分私钥r给用户\n");
+        printf("用户 '%s' 成功更新证书\n", subject_id);
         printf("--------------------------------\n");
     } else {
         printf("发送新证书和部分私钥失败\n");
@@ -645,11 +518,9 @@ void handle_message(int client_socket, const unsigned char *buffer, int data_len
     memcpy(message, buffer + 2, message_len);
     message[message_len] = '\0';
     
-    // 提取签名
+    // 提取签名和证书
     unsigned char signature[64];
     memcpy(signature, buffer + 2 + message_len, 64);
-    
-    // 提取证书
     ImpCert cert;
     memcpy(&cert, buffer + 2 + message_len + 64, sizeof(ImpCert));
     

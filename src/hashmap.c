@@ -74,7 +74,6 @@ hashmap* hashmap_create(size_t size,
     return map;
 }
 
-// 销毁通用哈希表
 void hashmap_destroy(hashmap* map) {
     if (!map) return;
     
@@ -96,7 +95,6 @@ void hashmap_destroy(hashmap* map) {
     free(map);
 }
 
-// 检查键是否存在
 bool hashmap_exists(hashmap* map, const void* key) {
     if (!map || !key) return false;
     
@@ -113,7 +111,6 @@ bool hashmap_exists(hashmap* map, const void* key) {
     return false;
 }
 
-// 获取键对应的值
 void* hashmap_get(hashmap* map, const void* key) {
     if (!map || !key) return NULL;
     
@@ -130,7 +127,6 @@ void* hashmap_get(hashmap* map, const void* key) {
     return NULL;
 }
 
-// 添加或更新键值对
 bool hashmap_put(hashmap* map, void* key, void* value, size_t value_size) {
     if (!map || !key) return false;
     
@@ -196,7 +192,6 @@ bool hashmap_put(hashmap* map, void* key, void* value, size_t value_size) {
     return true;
 }
 
-// 移除键值对
 bool hashmap_remove(hashmap* map, const void* key) {
     if (!map || !key) return false;
     
@@ -317,7 +312,6 @@ hashmap* crl_hashmap_create(size_t size) {
     return hashmap_create(size, binary_hash, binary_compare, free, free);
 }
 
-// 从文件加载CRL哈希表
 hashmap* crl_hashmap_load(const char* filename, size_t size) {
     FILE* file = fopen(filename, "r");
     hashmap* map = crl_hashmap_create(size);
@@ -378,7 +372,6 @@ hashmap* crl_hashmap_load(const char* filename, size_t size) {
     return map;
 }
 
-// 保存CRL哈希表到文件
 bool crl_hashmap_save(hashmap* map, const char* filename) {
     if (!map || !filename) return false;
     
