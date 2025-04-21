@@ -6,21 +6,19 @@
 #include "../../include/common.h"
 #include "../../include/gm_crypto.h"
 #include "../../include/imp_cert.h"
-#include "../../include/hashmap.h"
-#include "../../include/crlmanager.h"
 #include "../../include/network.h"
+
+// 定义测试次数
+#define MAX_TEST_COUNT 1000
 
 // 存储相关信息的全局变量
 ImpCert loaded_cert;
-hashmap* local_crl = NULL;
-CRLManager* crl_manager = NULL;
 unsigned char priv_key[SM2_PRI_MAX_SIZE];
 unsigned char pub_key[SM2_PUB_MAX_SIZE];
 unsigned char Q_ca[SM2_PUB_MAX_SIZE];
 int has_cert = 0;
 
 // 函数声明
-int init_crl_manager();
 int load_keys_and_cert(const char *user_id);
 int request_registration(int sock, const char *user_id);
 int request_cert_update(int sock, const char *user_id);
@@ -31,6 +29,7 @@ int main() {
     int sock = -1;
     int result = 0;
     int update_count = 0;
+    int success_count = 0;
     
     printf("启动自动证书更新测试程序\n");
     
@@ -43,13 +42,6 @@ int main() {
     // 初始化CA公钥
     if (!User_init(Q_ca)) {
         printf("加载CA公钥失败！\n");
-        sm2_params_cleanup();
-        return -1;
-    }
-    
-    // 初始化CRL管理器
-    if (!init_crl_manager()) {
-        printf("初始化CRL管理器失败！\n");
         sm2_params_cleanup();
         return -1;
     }
@@ -71,8 +63,6 @@ int main() {
         
         if (!result) {
             printf("注册失败，退出程序\n");
-            if (crl_manager) CRLManager_free(crl_manager);
-            if (local_crl) hashmap_destroy(local_crl);
             sm2_params_cleanup();
             return -1;
         }
@@ -86,10 +76,10 @@ int main() {
     }
     
     // 开始自动更新循环
-    printf("开始证书自动更新测试，每隔0.5秒更新一次\n");
+    printf("开始证书自动更新测试，计划测试%d次\n", MAX_TEST_COUNT);
     printf("按Ctrl+C终止程序\n\n");
     
-    while (1) {
+    while (update_count < MAX_TEST_COUNT) {
         update_count++;
         
         // 连接到服务器
@@ -104,48 +94,53 @@ int main() {
         result = request_cert_update(sock, user_id);
         close(sock);
         
-        // 输出结果
-        if (result) {
+        // 如果更新失败，等待1秒后重试一次
+        if (!result) {
+            printf("第%d次，第一次尝试失败，等待1秒后重试...\n", update_count);
+            usleep(1000000); // 等待1秒
+            
+            // 重新连接
+            sock = connect_to_server(server_ip, PORT);
+            if (sock < 0) {
+                printf("第%d次，重试失败 - 无法连接到服务器\n", update_count);
+                usleep(500000); // 等待0.5秒
+                continue;
+            }
+            
+            // 重试更新
+            result = request_cert_update(sock, user_id);
+            close(sock);
+            
+            // 输出最终结果
+            if (result) {
+                printf("第%d次，重试成功\n", update_count);
+                has_cert = load_keys_and_cert(user_id);
+                success_count++;
+            } else {
+                printf("第%d次，重试后仍然失败\n", update_count);
+            }
+        } else {
+            // 首次更新成功
             printf("第%d次，更新成功\n", update_count);
             has_cert = load_keys_and_cert(user_id);
-        } else {
-            printf("第%d次，更新失败\n", update_count);
+            success_count++;
         }
         
-        // 等待0.5秒
-        usleep(1000000);
+        // 等待0.6秒
+        usleep(600000);
     }
     
-    // 释放资源（实际上永远不会执行到这里，除非循环被中断）
-    if (crl_manager) CRLManager_free(crl_manager);
-    if (local_crl) hashmap_destroy(local_crl);
+    // 测试完成，打印统计信息
+    printf("\n===== 测试完成 =====\n");
+    printf("总测试次数: %d\n", update_count);
+    printf("成功次数: %d\n", success_count);
+    printf("成功率: %.2f%%\n", (success_count * 100.0) / update_count);
+    
+    // 释放资源
     sm2_params_cleanup();
     
     return 0;
-}
-
-// 初始化CRL管理器
-int init_crl_manager() {
-    // 初始化local_crl哈希表，初始大小为512
-    local_crl = crl_hashmap_create(512);
-    if (!local_crl) {
-        printf("创建local_crl哈希表失败！\n");
-        return 0;
-    }
-    
-    // 创建新的CRL管理器
-    crl_manager = CRLManager_init(512, 0);
-    if (!crl_manager) {
-        printf("创建CRL管理器失败！\n");
-        hashmap_destroy(local_crl);
-        local_crl = NULL;
-        return 0;
-    }
-    
-    return 1;
-}
-
-// 加载证书和密钥
+}// 加载证书和密钥
 int load_keys_and_cert(const char *user_id) {
     char cert_filename[SUBJECT_ID_SIZE + 5] = {0}; // ID + ".crt"
     char priv_key_filename[SUBJECT_ID_SIZE + 11] = {0}; // ID + "_priv.key"
@@ -197,17 +192,22 @@ int load_keys_and_cert(const char *user_id) {
 // 注册函数（简化版）
 int request_registration(int sock, const char *user_id) {
     unsigned char buffer[BUFFER_SIZE] = {0};
+    BIGNUM *Ku = NULL;
+    EC_POINT *Ru = NULL;
+    EC_POINT *Pu = NULL;
+    int result = 0;
     
     // 设置秘密值Ku
-    BIGNUM *Ku = BN_new();
+    Ku = BN_new();
+    if (!Ku) {
+        goto cleanup;
+    }
     BN_rand_range(Ku, order);
 
     // 计算临时公钥Ru=Ku*G
-    EC_POINT *Ru = EC_POINT_new(group);
+    Ru = EC_POINT_new(group);
     if (!Ru || !EC_POINT_mul(group, Ru, Ku, NULL, NULL, NULL)) {
-        BN_free(Ku);
-        if (Ru) EC_POINT_free(Ru);
-        return 0;
+        goto cleanup;
     }
     
     // 将Ru转换为字节数组以便发送
@@ -222,9 +222,7 @@ int request_registration(int sock, const char *user_id) {
     
     // 发送ID和Ru给CA
     if (!send_message(sock, CMD_SEND_ID_AND_RU, send_data, SUBJECT_ID_LEN + ru_len)) {
-        BN_free(Ku);
-        EC_POINT_free(Ru);
-        return 0;
+        goto cleanup;
     }
     
     // 接收CA发送的证书和部分私钥r
@@ -232,9 +230,7 @@ int request_registration(int sock, const char *user_id) {
     int data_len = recv_message(sock, &cmd, buffer, BUFFER_SIZE);
     if (data_len < 0 || cmd != CMD_SEND_CERT_AND_R || 
         data_len != sizeof(ImpCert) + SM2_PRI_MAX_SIZE) {
-        BN_free(Ku);
-        EC_POINT_free(Ru);
-        return 0;
+        goto cleanup;
     }
     
     // 解析证书和部分私钥r
@@ -254,13 +250,14 @@ int request_registration(int sock, const char *user_id) {
     
     // 保存证书
     if(!save_cert(&cert, cert_filename)) {
-        BN_free(Ku);
-        EC_POINT_free(Ru);
-        return 0;
+        goto cleanup;
     }
     
     // 获取隐式证书中的Pu
-    EC_POINT *Pu = EC_POINT_new(group);
+    Pu = EC_POINT_new(group);
+    if (!Pu) {
+        goto cleanup;
+    }
     getPu(&cert, Pu);
 
     // 计算隐式证书哈希值e
@@ -284,10 +281,7 @@ int request_registration(int sock, const char *user_id) {
         unsigned char signature[64] = {0};
         if (!sm2_sign(signature, test_msg, sizeof(test_msg), d_u) ||
             !sm2_verify(signature, test_msg, sizeof(test_msg), Qu)) {
-            BN_free(Ku);
-            EC_POINT_free(Ru);
-            EC_POINT_free(Pu);
-            return 0;
+            goto cleanup;
         }
     }
     
@@ -301,10 +295,7 @@ int request_registration(int sock, const char *user_id) {
         fwrite(d_u, 1, SM2_PRI_MAX_SIZE, key_file);
         fclose(key_file);
     } else {
-        BN_free(Ku);
-        EC_POINT_free(Ru);
-        EC_POINT_free(Pu);
-        return 0;
+        goto cleanup;
     }
     
     FILE *pub_key_file = fopen(pub_key_filename, "wb");
@@ -312,34 +303,38 @@ int request_registration(int sock, const char *user_id) {
         fwrite(Qu, 1, SM2_PUB_MAX_SIZE, pub_key_file);
         fclose(pub_key_file);
     } else {
-        BN_free(Ku);
-        EC_POINT_free(Ru);
-        EC_POINT_free(Pu);
-        return 0;
+        goto cleanup;
     }
     
-    // 释放资源
-    BN_free(Ku);
-    EC_POINT_free(Ru);
-    EC_POINT_free(Pu);
+    result = 1;
     
-    return 1;
+cleanup:
+    if (Ku) BN_free(Ku);
+    if (Ru) EC_POINT_free(Ru);
+    if (Pu) EC_POINT_free(Pu);
+    
+    return result;
 }
 
 // 证书更新函数（简化版）
 int request_cert_update(int sock, const char *user_id) {
     unsigned char buffer[BUFFER_SIZE] = {0};
+    BIGNUM *Ku = NULL;
+    EC_POINT *Ru = NULL;
+    EC_POINT *Pu = NULL;
+    int result = 0;
 
     // 设置新的秘密值Ku
-    BIGNUM *Ku = BN_new();
+    Ku = BN_new();
+    if (!Ku) {
+        goto cleanup;
+    }
     BN_rand_range(Ku, order);
 
     // 计算临时公钥Ru=Ku*G
-    EC_POINT *Ru = EC_POINT_new(group);
+    Ru = EC_POINT_new(group);
     if (!Ru || !EC_POINT_mul(group, Ru, Ku, NULL, NULL, NULL)) {
-        BN_free(Ku);
-        if (Ru) EC_POINT_free(Ru);
-        return 0;
+        goto cleanup;
     }
     
     // 将Ru转换为字节数组以便发送
@@ -355,9 +350,7 @@ int request_cert_update(int sock, const char *user_id) {
     // 用私钥对数据签名
     unsigned char signature[64];
     if (!sm2_sign(signature, sign_data, SUBJECT_ID_LEN + ru_len, priv_key)) {
-        BN_free(Ku);
-        EC_POINT_free(Ru);
-        return 0;
+        goto cleanup;
     }
     
     // 准备发送的完整数据：ID + Ru + 签名
@@ -367,9 +360,7 @@ int request_cert_update(int sock, const char *user_id) {
     
     // 发送更新请求给CA
     if (!send_message(sock, CMD_REQUEST_UPDATE, send_data, SUBJECT_ID_LEN + ru_len + 64)) {
-        BN_free(Ku);
-        EC_POINT_free(Ru);
-        return 0;
+        goto cleanup;
     }
     
     // 接收CA发送的新证书和部分私钥r
@@ -377,9 +368,7 @@ int request_cert_update(int sock, const char *user_id) {
     int data_len = recv_message(sock, &cmd, buffer, BUFFER_SIZE);
     if (data_len < 0 || cmd != CMD_SEND_UPDATED_CERT || 
         data_len != sizeof(ImpCert) + SM2_PRI_MAX_SIZE) {
-        BN_free(Ku);
-        EC_POINT_free(Ru);
-        return 0;
+        goto cleanup;
     }
     
     // 解析新证书和部分私钥r
@@ -392,13 +381,14 @@ int request_cert_update(int sock, const char *user_id) {
     char cert_filename[SUBJECT_ID_SIZE + 5] = {0};
     sprintf(cert_filename, "%s.crt", user_id);
     if (!save_cert(&new_cert, cert_filename)) {
-        BN_free(Ku);
-        EC_POINT_free(Ru);
-        return 0;
+        goto cleanup;
     }
     
     // 获取隐式证书中的Pu
-    EC_POINT *Pu = EC_POINT_new(group);
+    Pu = EC_POINT_new(group);
+    if (!Pu) {
+        goto cleanup;
+    }
     getPu(&new_cert, Pu);
 
     // 计算隐式证书哈希值
@@ -422,10 +412,7 @@ int request_cert_update(int sock, const char *user_id) {
         unsigned char signature[64] = {0};
         if (!sm2_sign(signature, test_msg, sizeof(test_msg), d_u) ||
             !sm2_verify(signature, test_msg, sizeof(test_msg), Qu)) {
-            BN_free(Ku);
-            EC_POINT_free(Ru);
-            EC_POINT_free(Pu);
-            return 0;
+            goto cleanup;
         }
     }
     
@@ -443,10 +430,7 @@ int request_cert_update(int sock, const char *user_id) {
         fwrite(d_u, 1, SM2_PRI_MAX_SIZE, key_file);
         fclose(key_file);
     } else {
-        BN_free(Ku);
-        EC_POINT_free(Ru);
-        EC_POINT_free(Pu);
-        return 0;
+        goto cleanup;
     }
     
     // 保存用户新公钥
@@ -458,16 +442,16 @@ int request_cert_update(int sock, const char *user_id) {
         fwrite(Qu, 1, SM2_PUB_MAX_SIZE, pub_key_file);
         fclose(pub_key_file);
     } else {
-        BN_free(Ku);
-        EC_POINT_free(Ru);
-        EC_POINT_free(Pu);
-        return 0;
+        goto cleanup;
     }
     
-    // 释放资源
-    BN_free(Ku);
-    EC_POINT_free(Ru);
-    EC_POINT_free(Pu);
+    result = 1;
     
-    return 1;
+cleanup:
+    if (Ku) BN_free(Ku);
+    if (Ru) EC_POINT_free(Ru);
+    if (Pu) EC_POINT_free(Pu);
+    
+    return result;
 } 
+

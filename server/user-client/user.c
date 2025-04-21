@@ -436,6 +436,11 @@ int request_registration(int sock, const char *user_id) {
     EC_POINT *Pu = EC_POINT_new(group);
     getPu(&cert, Pu);
 
+    // 打印Pu值，方便调试
+    char *Pu_hex = EC_POINT_point2hex(group, Pu, POINT_CONVERSION_UNCOMPRESSED, NULL);
+    printf("用户端Pu: %s\n", Pu_hex);
+    OPENSSL_free(Pu_hex);
+    
     // 计算隐式证书哈希值
     unsigned char e[32];
     sm3_hash((const unsigned char *)&cert, sizeof(ImpCert), e);
@@ -497,6 +502,11 @@ int request_cert_update(int sock, const char *user_id) {
     // 设置新的秘密值Ku
     BIGNUM *Ku = BN_new();
     BN_rand_range(Ku, order);
+    
+    // 打印Ku值
+    char *Ku_hex = BN_bn2hex(Ku);
+    printf("用户端Ku: %s\n", Ku_hex);
+    OPENSSL_free(Ku_hex);
 
     // 计算临时公钥Ru=Ku*G
     EC_POINT *Ru = EC_POINT_new(group);
@@ -506,6 +516,11 @@ int request_cert_update(int sock, const char *user_id) {
         if (Ru) EC_POINT_free(Ru);
         return 0;
     }
+    
+    // 打印Ru值
+    char *Ru_hex = EC_POINT_point2hex(group, Ru, POINT_CONVERSION_UNCOMPRESSED, NULL);
+    printf("用户端Ru: %s\n", Ru_hex);
+    OPENSSL_free(Ru_hex);
     
     // 将Ru转换为字节数组以便发送
     unsigned char Ru_bytes[SM2_PUB_MAX_SIZE];
@@ -579,6 +594,12 @@ int request_cert_update(int sock, const char *user_id) {
     // 获取隐式证书中的Pu
     EC_POINT *Pu = EC_POINT_new(group);
     getPu(&new_cert, Pu);
+    
+    // 打印Pu值，方便调试
+    char *Pu_hex = EC_POINT_point2hex(group, Pu, POINT_CONVERSION_UNCOMPRESSED, NULL);
+    printf("用户端Pu: %s\n", Pu_hex);
+    OPENSSL_free(Pu_hex);
+
 
     // 计算隐式证书哈希值
     unsigned char e[32];
@@ -588,10 +609,12 @@ int request_cert_update(int sock, const char *user_id) {
     // 公钥重构 Qu=e×Pu+Q_ca
     unsigned char Qu[SM2_PUB_MAX_SIZE];
     rec_pubkey(Qu, e, Pu, Q_ca); 
+    print_hex("用户新Qu", Qu, SM2_PUB_MAX_SIZE);
 
     // 计算最终私钥d_u=e×Ku+r (mod n)
     unsigned char d_u[SM2_PRI_MAX_SIZE];
     calculate_r(d_u, e, Ku, r, order);
+    print_hex("用户新d_u", d_u, SM2_PRI_MAX_SIZE);
 
     // 验证密钥对
     if(!verify_key_pair_bytes(group, Qu, d_u)) {

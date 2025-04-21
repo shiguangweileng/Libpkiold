@@ -120,9 +120,9 @@ int calculate_r(unsigned char *r_bytes, const unsigned char *e_bytes, const BIGN
     
     if (!e || !d || !r) {
         BN_CTX_free(ctx);
-        BN_free(e);
-        BN_free(d);
-        BN_free(r);
+        if (e) BN_free(e);
+        if (d) BN_free(d);
+        if (r) BN_free(r);
         return 0;
     }
     
@@ -133,8 +133,19 @@ int calculate_r(unsigned char *r_bytes, const unsigned char *e_bytes, const BIGN
     if (temp &&
         BN_mod_mul(temp, e, k, n, ctx) &&
         BN_mod_add(r, temp, d, n, ctx)) {
-        // 转换结果为字节串
-        success = BN_bn2bin(r, r_bytes) > 0;
+        
+        // 先清零输出缓冲区
+        memset(r_bytes, 0, SM2_PRI_MAX_SIZE);
+        
+        // 获取实际需要的字节数
+        int r_bytes_len = BN_num_bytes(r);
+        
+        // 确保BIGNUM转换为固定长度的字节数组（32字节），处理前导零的问题
+        if (r_bytes_len <= SM2_PRI_MAX_SIZE) {
+            // 将数据写入缓冲区的尾部，保留前导零
+            BN_bn2bin(r, r_bytes + (SM2_PRI_MAX_SIZE - r_bytes_len));
+            success = 1;
+        }
     }
     
     BN_CTX_end(ctx);
@@ -194,31 +205,34 @@ int rec_pubkey(unsigned char *Qu_bytes, const unsigned char *e_bytes,
     int success = 0;
     EC_POINT *Qu = EC_POINT_new(group);
     EC_POINT *Q_ca = EC_POINT_new(group);
+    EC_POINT *e_Pu = EC_POINT_new(group);
     BIGNUM *e = BN_bin2bn(e_bytes, 32, NULL);
+    BN_CTX *ctx = BN_CTX_new();
     
-    if (!Qu || !Q_ca || !e) {
+    if (!Qu || !Q_ca || !e || !ctx) {
         goto cleanup;
     }
     
     // 转换Q_ca字节串为EC_POINT
-    if (!EC_POINT_oct2point(group, Q_ca, Q_ca_bytes, SM2_PUB_MAX_SIZE, NULL)) {
+    if (!EC_POINT_oct2point(group, Q_ca, Q_ca_bytes, SM2_PUB_MAX_SIZE, ctx)) {
         goto cleanup;
     }
     
-    // 计算 Qu = e*Pu + Q_ca
-    if (!EC_POINT_mul(group, Qu, NULL, Pu, e, NULL) ||
-        !EC_POINT_add(group, Qu, Qu, Q_ca, NULL)) {
+    // 计算 Qu = e*Pu + Q_ca，使用ctx提高精度
+    if (!EC_POINT_mul(group, e_Pu, NULL, Pu, e, ctx) ||
+        !EC_POINT_add(group, Qu, e_Pu, Q_ca, ctx)) {
         goto cleanup;
     }
     
-    // 转换结果为字节串
+    // 转换结果为字节串，使用ctx提高精度
     success = EC_POINT_point2oct(group, Qu, POINT_CONVERSION_UNCOMPRESSED, 
-                                Qu_bytes, SM2_PUB_MAX_SIZE, NULL) > 0;
+                                Qu_bytes, SM2_PUB_MAX_SIZE, ctx) > 0;
     
 cleanup:
-    EC_POINT_free(Qu);
-    EC_POINT_free(Q_ca);
-    BN_free(e);
+    if (ctx) BN_CTX_free(ctx);
+    if (Qu) EC_POINT_free(Qu);
+    if (Q_ca) EC_POINT_free(Q_ca);
+    if (e) BN_free(e);
     
     return success;
 }
