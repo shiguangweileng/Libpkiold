@@ -13,29 +13,60 @@ static int set_Pu2cert(ImpCert *cert, const EC_POINT *pub_key) {
     // 提取公钥的x坐标和y坐标
     BIGNUM *x = BN_new();
     BIGNUM *y = BN_new();
-    if (!EC_POINT_get_affine_coordinates(group, pub_key, x, y, NULL)) {
-        BN_free(x);
-        BN_free(y);
+    
+    if (!x || !y || !EC_POINT_get_affine_coordinates(group, pub_key, x, y, NULL)) {
+        if (x) BN_free(x);
+        if (y) BN_free(y);
         return 0;
     }
 
     // 获取y坐标的奇偶性（用于后续重构）
     int y_is_odd = BN_is_odd(y);
 
-    // 将x坐标转换为二进制
-    unsigned char x_bin[32] = {0};
-    int x_len = BN_bn2bin(x, x_bin);
-    
-    // 将x坐标拷贝到证书公钥字段
+    // 先清零缓冲区
     memset(cert->PubKey, 0, sizeof(cert->PubKey));
-    // 第一个字节存储y的奇偶性信息 (0x02表示y为偶数，0x03表示y为奇数)
+    // 第一个字节存储y的奇偶性信息 (0x02表示y为偶数，0x03表示y为奇偶)
     cert->PubKey[0] = y_is_odd ? 0x03 : 0x02;
-    memcpy(cert->PubKey + 1, x_bin, x_len);
+    
+    // 将x坐标转换为固定长度的二进制，处理前导零问题
+    int x_bytes_len = BN_num_bytes(x);
+    if (x_bytes_len <= 32) {
+        // 固定32字节，将x放在末尾，保留前导零
+        BN_bn2bin(x, cert->PubKey + 1 + (32 - x_bytes_len));
+    } else {
+        // 这种情况不应该发生，因为SM2曲线的x坐标不会超过32字节
+        printf("错误：x坐标长度超过32字节！\n");
+        BN_free(x);
+        BN_free(y);
+        return 0;
+    }
     
     BN_free(x);
     BN_free(y);
     return 1;
 }
+
+int getPu(const ImpCert *cert, EC_POINT *Pu) {
+    if (!cert || !group || !Pu) {
+        return 0;
+    }
+    
+    // 提取y的奇偶性信息
+    int y_is_odd = (cert->PubKey[0] == 0x03);
+    
+    // 公钥字段的第一个字节是标识符，后32个字节是x坐标
+    BIGNUM *x = BN_bin2bn(cert->PubKey + 1, 32, NULL);
+    if (!x) {
+        return 0;
+    }
+    
+    // 根据x坐标和y的奇偶性重构点
+    int success = EC_POINT_set_compressed_coordinates(group, Pu, x, y_is_odd, NULL);
+    
+    BN_free(x);
+    return success;
+}
+
 
 int set_cert(ImpCert *cert, 
              const unsigned char *serial_num,
@@ -154,27 +185,6 @@ void print_cert_info(const ImpCert *cert) {
         printf("%02x", cert->PubKey[i]);
     }
     printf("\n");
-}
-
-int getPu(const ImpCert *cert, EC_POINT *Pu) {
-    if (!cert || !group || !Pu) {
-        return 0;
-    }
-    
-    // 提取y的奇偶性信息
-    int y_is_odd = (cert->PubKey[0] == 0x03);
-    
-    // 提取x坐标
-    BIGNUM *x = BN_bin2bn(cert->PubKey + 1, 32, NULL);
-    if (!x) {
-        return 0;
-    }
-    
-    // 根据x坐标和y的奇偶性重构点
-    int success = EC_POINT_set_compressed_coordinates(group, Pu, x, y_is_odd, NULL);
-    
-    BN_free(x);
-    return success;
 }
 
 

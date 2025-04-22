@@ -119,7 +119,6 @@ int main() {
     // 加载或初始化CRLManager
     crl_manager = CRLManager_load_from_file(CRL_MANAGER_FILE);
     if (!crl_manager) {
-        printf("无法加载CRL管理器，创建新的管理器...\n");
         crl_manager = CRLManager_init(512, 512);
         if (!crl_manager) {
             printf("无法创建CRL管理器！\n");
@@ -224,13 +223,17 @@ void handle_registration(int client_socket, const unsigned char *buffer, int dat
         return;
     }
     
-    // 解析Ru（位于ID之后）
-    EC_POINT *Ru = EC_POINT_new(group);
+    EC_POINT *Ru = NULL;
+    BIGNUM *k = NULL;
+    EC_POINT *Pu = NULL;
+    char* serial_num = NULL;
+    int ret = 0;
+    
+    Ru = EC_POINT_new(group);
     if (!Ru || !EC_POINT_oct2point(group, Ru, buffer + SUBJECT_ID_LEN, 
                                    data_len - SUBJECT_ID_LEN, NULL)) {
         printf("解析临时公钥失败\n");
-        if (Ru) EC_POINT_free(Ru);
-        return;
+        goto cleanup;
     }
     
     printf("%s---证书注册\n", subject_id);
@@ -238,22 +241,30 @@ void handle_registration(int client_socket, const unsigned char *buffer, int dat
     // 检查用户是否存在
     if (check_user_exists(subject_id)) {
         printf("用户ID '%s' 已存在，拒绝注册\n", subject_id);
-        EC_POINT_free(Ru);
-        return;
+        goto cleanup;
     }
     
     // --------step2:CA端生成隐式证书计算部分重构值-----------
+
     // CA选取随机值k
-    BIGNUM *k = BN_new();
+    k = BN_new();
     BN_rand_range(k, order);
 
     // 计算公钥重构值Pu=Ru+k*G
-    EC_POINT *Pu = EC_POINT_new(group);
-    EC_POINT_mul(group, Pu, k, NULL, NULL, NULL);
-    EC_POINT_add(group, Pu, Ru, Pu, NULL);
+    Pu = EC_POINT_new(group);
+    if (!Pu) {
+        printf("无法分配内存给Pu\n");
+        goto cleanup;
+    }
+    
+    if (!EC_POINT_mul(group, Pu, k, NULL, NULL, NULL) ||
+        !EC_POINT_add(group, Pu, Ru, Pu, NULL)) {
+        printf("计算Pu失败\n");
+        goto cleanup;
+    }
 
     // 生成新的证书序列号
-    char* serial_num = generate_serial_num();
+    serial_num = generate_serial_num();
     printf("生成新证书，序列号: %s\n", serial_num);
 
     // 生成隐式证书
@@ -268,10 +279,7 @@ void handle_registration(int client_socket, const unsigned char *buffer, int dat
               expire_time,
               Pu)){
         printf("证书设置失败！\n");
-        EC_POINT_free(Ru);
-        EC_POINT_free(Pu);
-        BN_free(k);
-        return;
+        goto cleanup;
     }
     
     // 保存证书到文件系统，使用用户ID命名
@@ -289,10 +297,7 @@ void handle_registration(int client_socket, const unsigned char *buffer, int dat
     // 保存用户信息到UserList
     if (!save_user_list(subject_id, cert_hash)) {
         printf("保存用户数据失败！\n");
-        EC_POINT_free(Ru);
-        EC_POINT_free(Pu);
-        BN_free(k);
-        return;
+        goto cleanup;
     }
     
     // 计算部分私钥r=e×k+d_ca (mod n)
@@ -309,17 +314,26 @@ void handle_registration(int client_socket, const unsigned char *buffer, int dat
     if (send_message(client_socket, CMD_SEND_CERT_AND_R, response, sizeof(response))) {
         printf("用户 '%s' 成功注册并保存到UserList\n", subject_id);
         printf("--------------------------------\n");
+        ret = 1;
     }
     else{
         printf("发送证书和部分私钥失败\n");
     }
-    // 释放资源
-    EC_POINT_free(Ru);
-    EC_POINT_free(Pu);
-    BN_free(k);
+
+cleanup:
+    if (Ru) EC_POINT_free(Ru);
+    if (k) BN_free(k);
+    if (Pu) EC_POINT_free(Pu);
 }
 
 void handle_cert_update(int client_socket, const unsigned char *buffer, int data_len) {
+    // 为资源分配变量
+    EC_POINT *Ru = NULL;
+    EC_POINT *Pu = NULL;
+    EC_POINT *new_Pu = NULL;
+    BIGNUM *k = NULL;
+    int ret = 0;
+    
     // 验证接收的数据长度
     if (data_len < SUBJECT_ID_LEN + SM2_PUB_MAX_SIZE + 64) {
         printf("接收到的数据长度错误\n");
@@ -371,25 +385,25 @@ void handle_cert_update(int client_socket, const unsigned char *buffer, int data
     }
     
     // 解析Ru（位于ID之后）
-    EC_POINT *Ru = EC_POINT_new(group);
+    Ru = EC_POINT_new(group);
     if (!Ru || !EC_POINT_oct2point(group, Ru, buffer + SUBJECT_ID_LEN, 
                                    SM2_PUB_MAX_SIZE, NULL)) {
         printf("解析临时公钥失败\n");
-        if (Ru) EC_POINT_free(Ru);
-        return;
+        goto cleanup;
     }
     
     // 重构用户的公钥用于验证签名
-    EC_POINT *Pu = EC_POINT_new(group);
-    getPu(&old_cert, Pu);
+    Pu = EC_POINT_new(group);
+    if (!getPu(&old_cert, Pu)) {
+        printf("获取Pu失败\n");
+        goto cleanup;
+    }
     
     // 重构用户公钥 Qu=e×Pu+Q_ca
     unsigned char Qu[SM2_PUB_MAX_SIZE];
     if (!rec_pubkey(Qu, old_cert_hash, Pu, Q_ca)) {
         printf("重构用户公钥失败\n");
-        EC_POINT_free(Ru);
-        EC_POINT_free(Pu);
-        return;
+        goto cleanup;
     }
     //print_hex("重构用户公钥Qu", Qu, SM2_PUB_MAX_SIZE);
     
@@ -401,28 +415,30 @@ void handle_cert_update(int client_socket, const unsigned char *buffer, int data
     // 验证签名
     if (!sm2_verify(signature, sign_data, SUBJECT_ID_LEN + SM2_PUB_MAX_SIZE, Qu)) {
         printf("签名验证失败，拒绝更新请求\n");
-        EC_POINT_free(Ru);
-        EC_POINT_free(Pu);
-        return;
+        goto cleanup;
     }
-    
-    printf("签名验证成功，处理更新请求...\n");
-    
+
     // --------步骤与证书注册类似:CA端生成新隐式证书-----------
     // CA选取随机值k
-    BIGNUM *k = BN_new();
+    k = BN_new();
     BN_rand_range(k, order);
 
     // 计算公钥重构值Pu=Ru+k*G
-    EC_POINT *new_Pu = EC_POINT_new(group);
-    EC_POINT_mul(group, new_Pu, k, NULL, NULL, NULL);
-    EC_POINT_add(group, new_Pu, Ru, new_Pu, NULL);
+    new_Pu = EC_POINT_new(group);
+    if (!new_Pu) {
+        printf("创建new_Pu失败\n");
+        goto cleanup;
+    }
+    
+    if (!EC_POINT_mul(group, new_Pu, k, NULL, NULL, NULL) ||
+        !EC_POINT_add(group, new_Pu, Ru, new_Pu, NULL)) {
+        printf("计算new_Pu失败\n");
+        goto cleanup;
+    }
 
-    // 生成新的证书序列号
+    // 生成新的证书
     char* serial_num = generate_serial_num();
     printf("生成更新证书，序列号: %s\n", serial_num);
-
-    // 生成新隐式证书
     ImpCert new_cert;
     time_t current_time = time(NULL);
     time_t expire_time = current_time + 60*60; // 1h有效期
@@ -434,11 +450,7 @@ void handle_cert_update(int client_socket, const unsigned char *buffer, int data
               expire_time,
               new_Pu)){
         printf("新证书设置失败！\n");
-        EC_POINT_free(Ru);
-        EC_POINT_free(Pu);
-        EC_POINT_free(new_Pu);
-        BN_free(k);
-        return;
+        goto cleanup;
     }
 
     // 计算新隐式证书的哈希值
@@ -473,7 +485,10 @@ void handle_cert_update(int client_socket, const unsigned char *buffer, int data
     // 计算部分私钥r=e×k+d_ca (mod n)
     unsigned char r[SM2_PRI_MAX_SIZE];
     calculate_r(r, new_cert_hash, k, d_ca, order);
-    print_hex("新部分私钥r", r, SM2_PRI_MAX_SIZE);
+
+    // 公钥重构 Qu=e×Pu+Q_ca
+    unsigned char tQu[SM2_PUB_MAX_SIZE];
+    rec_pubkey(tQu, new_cert_hash, new_Pu, Q_ca);
     
     // 准备响应数据：新证书+部分私钥r
     unsigned char response[sizeof(ImpCert) + SM2_PRI_MAX_SIZE];
@@ -484,15 +499,16 @@ void handle_cert_update(int client_socket, const unsigned char *buffer, int data
     if (send_message(client_socket, CMD_SEND_UPDATED_CERT, response, sizeof(response))) {
         printf("用户 '%s' 成功更新证书\n", subject_id);
         printf("--------------------------------\n");
+        ret = 1;
     } else {
         printf("发送新证书和部分私钥失败\n");
     }
     
-    // 释放资源
-    EC_POINT_free(Ru);
-    EC_POINT_free(Pu);
-    EC_POINT_free(new_Pu);
-    BN_free(k);
+cleanup:
+    if (Ru) EC_POINT_free(Ru);
+    if (Pu) EC_POINT_free(Pu);
+    if (new_Pu) EC_POINT_free(new_Pu);
+    if (k) BN_free(k);
 }
 
 void handle_message(int client_socket, const unsigned char *buffer, int data_len) {
@@ -566,7 +582,6 @@ void handle_message(int client_socket, const unsigned char *buffer, int data_len
         printf("签名验证失败，拒绝消息\n");
     }
     
-    // 释放资源
     free(message);
     EC_POINT_free(Pu);
 }
@@ -690,8 +705,6 @@ void handle_cert_revoke(int client_socket, const unsigned char *buffer, int data
         return;
     }
     
-    printf("签名验证成功，处理撤销请求...\n");
-    
     // 获取用户证书的到期时间
     time_t expire_time;
     memcpy(&expire_time, cert.Validity + sizeof(time_t), sizeof(time_t));
@@ -755,11 +768,15 @@ void handle_cert_revoke(int client_socket, const unsigned char *buffer, int data
         printf("--------------------------------\n");
     }
     
-    // 释放资源
     EC_POINT_free(Pu);
 }
 
 void handle_crl_update(int client_socket, const unsigned char *buffer, int data_len) {
+    UpdatedCRL* updated_crl = NULL;
+    unsigned char *sign_data = NULL;
+    unsigned char *send_data = NULL;
+    int ret = 0;
+    
     // 验证接收到的数据长度
     if (data_len != sizeof(int) * 2) {
         printf("接收到的CRL版本信息长度错误\n");
@@ -781,9 +798,9 @@ void handle_crl_update(int client_socket, const unsigned char *buffer, int data_
         return;
     }
 
-    UpdatedCRL* updated_crl = CRLManager_generate_update(crl_manager, 
-                                                        user_base_v, 
-                                                        user_removed_v);
+    updated_crl = CRLManager_generate_update(crl_manager, 
+                                            user_base_v, 
+                                            user_removed_v);
     if (!updated_crl) {
         printf("生成CRL增量更新失败\n");
         send_message(client_socket, CMD_SEND_CRL_UPDATE, NULL, 0);
@@ -809,12 +826,12 @@ void handle_crl_update(int client_socket, const unsigned char *buffer, int data_
     uint64_t ts_network = htobe64(timestamp);  // 转换为网络字节序
     
     // 准备要签名的数据：序列化数据 + 时间戳
-    unsigned char *sign_data = malloc(serialized_size + 8);
+    sign_data = malloc(serialized_size + 8);
     if (!sign_data) {
         printf("内存分配失败\n");
         CRLManager_free_update(updated_crl);
         send_message(client_socket, CMD_SEND_CRL_UPDATE, NULL, 0);
-        return;
+        goto cleanup;
     }
     
     // 复制序列化数据和时间戳到签名数据中
@@ -825,21 +842,14 @@ void handle_crl_update(int client_socket, const unsigned char *buffer, int data_
     unsigned char signature[64];
     if (!sm2_sign(signature, sign_data, serialized_size + 8, d_ca)) {
         printf("计算CRL更新签名失败\n");
-        free(sign_data);
-        CRLManager_free_update(updated_crl);
-        send_message(client_socket, CMD_SEND_CRL_UPDATE, NULL, 0);
-        return;
+        goto cleanup;
     }
     
-    free(sign_data);
-    
     // 准备完整的发送数据：序列化数据 + 时间戳 + 签名
-    unsigned char *send_data = malloc(serialized_size + 8 + 64);
+    send_data = malloc(serialized_size + 8 + 64);
     if (!send_data) {
         printf("内存分配失败\n");
-        CRLManager_free_update(updated_crl);
-        send_message(client_socket, CMD_SEND_CRL_UPDATE, NULL, 0);
-        return;
+        goto cleanup;
     }
     
     memcpy(send_data, update_buffer, serialized_size);
@@ -853,48 +863,55 @@ void handle_crl_update(int client_socket, const unsigned char *buffer, int data_
     } else {
         printf("成功发送CRL增量更新，大小=%d字节\n", serialized_size + 8 + 64);
         printf("--------------------------------\n");
+        ret = 1;
     }
     
-    free(send_data);
-    CRLManager_free_update(updated_crl);
+cleanup:
+    if (sign_data) free(sign_data);
+    if (send_data) free(send_data);
+    if (updated_crl) CRLManager_free_update(updated_crl);
 }
 
 int local_generate_cert(const char *subject_id) { 
-    // 检查用户是否存在
+    BIGNUM *Ku = NULL;
+    BIGNUM *k = NULL;
+    EC_POINT *Ru = NULL;
+    EC_POINT *Pu = NULL;
+    char* serial_num = NULL;
+    int ret = 0;
+
     if (check_user_exists(subject_id)) {
         printf("用户ID '%s' 已存在，拒绝注册\n", subject_id);
         return 0;
     }
     
     //--------step1:用户端(现在由CA模拟)-----------
-    // 设置秘密值Ku
-    BIGNUM *Ku = BN_new();
+    Ku = BN_new();
     BN_rand_range(Ku, order);
 
     // 计算临时公钥Ru=Ku*G
-    EC_POINT *Ru = EC_POINT_new(group);
-    if (!Ru || !EC_POINT_mul(group, Ru, Ku, NULL, NULL, NULL)) {
+    Ru = EC_POINT_new(group);
+    if (!EC_POINT_mul(group, Ru, Ku, NULL, NULL, NULL)) {
         printf("计算临时公钥Ru失败\n");
-        BN_free(Ku);
-        if (Ru) EC_POINT_free(Ru);
-        return 0;
+        goto cleanup;
     }
     
     // --------step2:CA端生成隐式证书计算部分重构值-----------
     // CA选取随机值k
-    BIGNUM *k = BN_new();
+    k = BN_new();
     BN_rand_range(k, order);
 
     // 计算公钥重构值Pu=Ru+k*G
-    EC_POINT *Pu = EC_POINT_new(group);
-    EC_POINT_mul(group, Pu, k, NULL, NULL, NULL);
-    EC_POINT_add(group, Pu, Ru, Pu, NULL);
+    Pu = EC_POINT_new(group);
+    if (!EC_POINT_mul(group, Pu, k, NULL, NULL, NULL) ||
+        !EC_POINT_add(group, Pu, Ru, Pu, NULL)) {
+        printf("计算Pu失败\n");
+        goto cleanup;
+    }
 
-    // 生成新的证书序列号
-    char* serial_num = generate_serial_num();
+    // 生成新的证书
+    serial_num = generate_serial_num();
     printf("生成新证书，序列号: %s\n", serial_num);
-
-    // 生成隐式证书
     ImpCert cert;
     time_t current_time = time(NULL);
     time_t expire_time = current_time + 60*60; // 1h有效期
@@ -906,13 +923,8 @@ int local_generate_cert(const char *subject_id) {
               expire_time,
               Pu)){
         printf("证书设置失败！\n");
-        EC_POINT_free(Ru);
-        EC_POINT_free(Pu);
-        BN_free(k);
-        BN_free(Ku);
-        return 0;
+        goto cleanup;
     }
-
     
     // 保存证书到UserCerts目录下
     char cert_filename[100] = {0};
@@ -929,11 +941,7 @@ int local_generate_cert(const char *subject_id) {
     // 保存用户信息到UserList
     if (!save_user_list(subject_id, cert_hash)) {
         printf("保存用户数据失败！\n");
-        EC_POINT_free(Ru);
-        EC_POINT_free(Pu);
-        BN_free(k);
-        BN_free(Ku);
-        return 0;
+        goto cleanup;
     }
     
     printf("用户 '%s' 成功注册并保存到UserList\n", subject_id);
@@ -946,24 +954,17 @@ int local_generate_cert(const char *subject_id) {
     // 计算最终私钥d_u=e×Ku+r (mod n)
     unsigned char d_u[SM2_PRI_MAX_SIZE];
     calculate_r(d_u, cert_hash, Ku, r, order);
-    print_hex("用户私钥d_u", d_u, SM2_PRI_MAX_SIZE);
     
     // 公钥重构 Qu=e×Pu+Q_ca
     unsigned char Qu[SM2_PUB_MAX_SIZE];
     rec_pubkey(Qu, cert_hash, Pu, Q_ca);
-    print_hex("用户公钥Qu", Qu, SM2_PUB_MAX_SIZE);
-    
-    // 验证密钥对
-    if(verify_key_pair_bytes(group, Qu, d_u)){
-        printf("密钥对验证成功！\n");
-    }else{
+
+    if(!verify_key_pair_bytes(group, Qu, d_u)){
         printf("密钥对验证失败！\n");
-        EC_POINT_free(Ru);
-        EC_POINT_free(Pu);
-        BN_free(k);
-        BN_free(Ku);
-        return 0;
+        goto cleanup;
     }
+    
+    printf("密钥对验证成功！\n");
     
     // 保存用户私钥
     char priv_key_filename[100] = {0};
@@ -988,20 +989,26 @@ int local_generate_cert(const char *subject_id) {
         printf("警告：无法保存用户公钥到文件\n");
     }
     
-    // 释放资源
-    EC_POINT_free(Ru);
-    EC_POINT_free(Pu);
-    BN_free(k);
-    BN_free(Ku);
-    
     printf("--------------------------------\n");
+    ret = 1;
     
-    return 1;
+cleanup:
+    // 释放资源
+    if (Ru) EC_POINT_free(Ru);
+    if (Pu) EC_POINT_free(Pu);
+    if (k) BN_free(k);
+    if (Ku) BN_free(Ku);
+    
+    return ret;
 }
 
 int local_update_cert(const char *subject_id) {
+    BIGNUM *Ku = NULL;
+    BIGNUM *k = NULL;
+    EC_POINT *Ru = NULL;
+    EC_POINT *new_Pu = NULL;
+    int ret = 0;
     
-    // 检查用户是否存在
     if (!check_user_exists(subject_id)) {
         printf("用户ID '%s' 不存在，拒绝更新\n", subject_id);
         return 0;
@@ -1038,33 +1045,32 @@ int local_update_cert(const char *subject_id) {
     
     //--------step1:用户端(现在由CA模拟)-----------
     // 设置秘密值Ku
-    BIGNUM *Ku = BN_new();
+    Ku = BN_new();
     BN_rand_range(Ku, order);
 
     // 计算临时公钥Ru=Ku*G
-    EC_POINT *Ru = EC_POINT_new(group);
-    if (!Ru || !EC_POINT_mul(group, Ru, Ku, NULL, NULL, NULL)) {
+    Ru = EC_POINT_new(group);
+    if (!EC_POINT_mul(group, Ru, Ku, NULL, NULL, NULL)) {
         printf("计算临时公钥Ru失败\n");
-        BN_free(Ku);
-        if (Ru) EC_POINT_free(Ru);
-        return 0;
+        goto cleanup;
     }
     
     // --------步骤与证书注册类似:CA端生成新隐式证书-----------
     // CA选取随机值k
-    BIGNUM *k = BN_new();
+    k = BN_new();
     BN_rand_range(k, order);
 
     // 计算公钥重构值Pu=Ru+k*G
-    EC_POINT *new_Pu = EC_POINT_new(group);
-    EC_POINT_mul(group, new_Pu, k, NULL, NULL, NULL);
-    EC_POINT_add(group, new_Pu, Ru, new_Pu, NULL);
+    new_Pu = EC_POINT_new(group);
+    if (!EC_POINT_mul(group, new_Pu, k, NULL, NULL, NULL) ||
+        !EC_POINT_add(group, new_Pu, Ru, new_Pu, NULL)) {
+        printf("计算new_Pu失败\n");
+        goto cleanup;
+    }
 
-    // 生成新的证书序列号
+    // 生成新的证书
     char* serial_num = generate_serial_num();
     printf("生成更新证书，序列号: %s\n", serial_num);
-
-    // 生成新隐式证书
     ImpCert new_cert;
     time_t current_time = time(NULL);
     time_t expire_time = current_time + 60*60; // 1h有效期
@@ -1076,11 +1082,7 @@ int local_update_cert(const char *subject_id) {
               expire_time,
               new_Pu)){
         printf("新证书设置失败！\n");
-        EC_POINT_free(Ru);
-        EC_POINT_free(new_Pu);
-        BN_free(k);
-        BN_free(Ku);
-        return 0;
+        goto cleanup;
     }
 
     // 计算新隐式证书的哈希值
@@ -1122,24 +1124,18 @@ int local_update_cert(const char *subject_id) {
     // 计算最终私钥d_u=e×Ku+r (mod n)
     unsigned char d_u[SM2_PRI_MAX_SIZE];
     calculate_r(d_u, new_cert_hash, Ku, r, order);
-    print_hex("用户新私钥d_u", d_u, SM2_PRI_MAX_SIZE);
     
     // 公钥重构 Qu=e×Pu+Q_ca
     unsigned char Qu[SM2_PUB_MAX_SIZE];
     rec_pubkey(Qu, new_cert_hash, new_Pu, Q_ca);
-    print_hex("用户新公钥Qu", Qu, SM2_PUB_MAX_SIZE);
     
     // 验证密钥对
-    if(verify_key_pair_bytes(group, Qu, d_u)){
-        printf("新密钥对验证成功！\n");
-    }else{
+    if(!verify_key_pair_bytes(group, Qu, d_u)){
         printf("新密钥对验证失败！\n");
-        EC_POINT_free(Ru);
-        EC_POINT_free(new_Pu);
-        BN_free(k);
-        BN_free(Ku);
-        return 0;
+        goto cleanup;
     }
+    
+    printf("新密钥对验证成功！\n");
     
     // 保存用户新私钥供后续使用
     char priv_key_filename[100] = {0};
@@ -1165,15 +1161,16 @@ int local_update_cert(const char *subject_id) {
         printf("警告：无法保存更新后的用户公钥到文件\n");
     }
     
-    // 释放资源
-    EC_POINT_free(Ru);
-    EC_POINT_free(new_Pu);
-    BN_free(k);
-    BN_free(Ku);
-    
     printf("--------------------------------\n");
+    ret = 1;
     
-    return 1;
+cleanup:
+    if (Ru) EC_POINT_free(Ru);
+    if (new_Pu) EC_POINT_free(new_Pu);
+    if (k) BN_free(k);
+    if (Ku) BN_free(Ku);
+    
+    return ret;
 }
 
 // ---- 用户数据管理相关函数 ----
