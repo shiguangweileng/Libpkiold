@@ -31,11 +31,27 @@ int main() {
     int update_count = 0;
     int success_count = 0;
     
+    // 时间开销统计变量
+    struct timeval start_time, end_time;
+    double *time_costs = NULL;
+    double total_time = 0.0;
+    double min_time = -1.0;
+    double max_time = 0.0;
+    double avg_time = 0.0;
+    
     printf("启动自动证书更新测试程序\n");
+    
+    // 分配时间数组
+    time_costs = (double *)malloc(MAX_TEST_COUNT * sizeof(double));
+    if (!time_costs) {
+        printf("内存分配失败\n");
+        return -1;
+    }
     
     // 初始化SM2参数
     if (!sm2_params_init()) {
         printf("SM2参数初始化失败\n");
+        free(time_costs);
         return -1;
     }
     
@@ -43,6 +59,7 @@ int main() {
     if (!User_init(Q_ca)) {
         printf("加载CA公钥失败！\n");
         sm2_params_cleanup();
+        free(time_costs);
         return -1;
     }
     
@@ -55,6 +72,8 @@ int main() {
         sock = connect_to_server(server_ip, PORT);
         if (sock < 0) {
             printf("无法连接到服务器\n");
+            sm2_params_cleanup();
+            free(time_costs);
             return -1;
         }
         
@@ -64,6 +83,7 @@ int main() {
         if (!result) {
             printf("注册失败，退出程序\n");
             sm2_params_cleanup();
+            free(time_costs);
             return -1;
         }
         
@@ -71,6 +91,8 @@ int main() {
         has_cert = load_keys_and_cert(user_id);
         if (!has_cert) {
             printf("无法加载新证书，退出程序\n");
+            sm2_params_cleanup();
+            free(time_costs);
             return -1;
         }
     }
@@ -81,6 +103,9 @@ int main() {
     
     while (update_count < MAX_TEST_COUNT) {
         update_count++;
+        
+        // 开始计时
+        gettimeofday(&start_time, NULL);
         
         // 连接到服务器
         sock = connect_to_server(server_ip, PORT);
@@ -94,10 +119,16 @@ int main() {
         result = request_cert_update(sock, user_id);
         close(sock);
         
+        // 结束计时
+        gettimeofday(&end_time, NULL);
+        
         // 如果更新失败，等待1秒后重试一次
         if (!result) {
             printf("第%d次，第一次尝试失败，等待1秒后重试...\n", update_count);
             usleep(1000000); // 等待1秒
+            
+            // 更新开始计时点
+            gettimeofday(&start_time, NULL);
             
             // 重新连接
             sock = connect_to_server(server_ip, PORT);
@@ -111,11 +142,26 @@ int main() {
             result = request_cert_update(sock, user_id);
             close(sock);
             
+            // 重新结束计时
+            gettimeofday(&end_time, NULL);
+            
             // 输出最终结果
             if (result) {
                 printf("第%d次，重试成功\n", update_count);
                 has_cert = load_keys_and_cert(user_id);
                 success_count++;
+                
+                // 计算时间开销（毫秒）
+                double elapsed_ms = (end_time.tv_sec - start_time.tv_sec) * 1000.0 + 
+                                   (end_time.tv_usec - start_time.tv_usec) / 1000.0;
+                time_costs[success_count-1] = elapsed_ms;
+                
+                // 更新统计数据
+                total_time += elapsed_ms;
+                if (min_time < 0 || elapsed_ms < min_time) min_time = elapsed_ms;
+                if (elapsed_ms > max_time) max_time = elapsed_ms;
+                
+                printf("本次更新时间开销: %.2f ms\n", elapsed_ms);
             } else {
                 printf("第%d次，重试后仍然失败\n", update_count);
             }
@@ -124,10 +170,27 @@ int main() {
             printf("第%d次，更新成功\n", update_count);
             has_cert = load_keys_and_cert(user_id);
             success_count++;
+            
+            // 计算时间开销（毫秒）
+            double elapsed_ms = (end_time.tv_sec - start_time.tv_sec) * 1000.0 + 
+                               (end_time.tv_usec - start_time.tv_usec) / 1000.0;
+            time_costs[success_count-1] = elapsed_ms;
+            
+            // 更新统计数据
+            total_time += elapsed_ms;
+            if (min_time < 0 || elapsed_ms < min_time) min_time = elapsed_ms;
+            if (elapsed_ms > max_time) max_time = elapsed_ms;
+            
+            printf("本次更新时间开销: %.2f ms\n", elapsed_ms);
         }
         
         // 等待0.6秒
         usleep(600000);
+    }
+    
+    // 计算平均时间
+    if (success_count > 0) {
+        avg_time = total_time / success_count;
     }
     
     // 测试完成，打印统计信息
@@ -135,12 +198,19 @@ int main() {
     printf("总测试次数: %d\n", update_count);
     printf("成功次数: %d\n", success_count);
     printf("成功率: %.2f%%\n", (success_count * 100.0) / update_count);
+    printf("\n===== 时间统计 =====\n");
+    printf("平均更新时间: %.2f ms\n", avg_time);
+    printf("最短更新时间: %.2f ms\n", min_time);
+    printf("最长更新时间: %.2f ms\n", max_time);
     
     // 释放资源
+    free(time_costs);
     sm2_params_cleanup();
     
     return 0;
-}// 加载证书和密钥
+}
+
+// 加载证书和密钥
 int load_keys_and_cert(const char *user_id) {
     char cert_filename[SUBJECT_ID_SIZE + 5] = {0}; // ID + ".crt"
     char priv_key_filename[SUBJECT_ID_SIZE + 11] = {0}; // ID + "_priv.key"

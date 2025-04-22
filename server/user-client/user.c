@@ -89,8 +89,6 @@ int main() {
         
         // 检查本地是否存在该ID的证书
         has_cert = load_keys_and_cert(user_id);
-        // print_hex("用户公钥Qu", pub_key, SM2_PUB_MAX_SIZE);
-        // print_hex("用户私钥r", priv_key, SM2_PRI_MAX_SIZE);
         
         // 内层循环 - 处理当前用户的多次操作
         int user_session = 1;
@@ -352,19 +350,21 @@ int load_keys_and_cert(const char *user_id) {
 //----------------用户证书操作函数实现-------------------
 int request_registration(int sock, const char *user_id) {
     unsigned char buffer[BUFFER_SIZE] = {0};
+    BIGNUM *Ku = NULL;
+    EC_POINT *Ru = NULL;
+    EC_POINT *Pu = NULL;
+    int ret = 0;
     
     //--------step1:用户端-----------
     // 设置秘密值Ku
-    BIGNUM *Ku = BN_new();
+    Ku = BN_new();
     BN_rand_range(Ku, order);
 
     // 计算临时公钥Ru=Ku*G
-    EC_POINT *Ru = EC_POINT_new(group);
-    if (!Ru || !EC_POINT_mul(group, Ru, Ku, NULL, NULL, NULL)) {
+    Ru = EC_POINT_new(group);
+    if (!EC_POINT_mul(group, Ru, Ku, NULL, NULL, NULL)) {
         printf("计算临时公钥Ru失败\n");
-        BN_free(Ku);
-        if (Ru) EC_POINT_free(Ru);
-        return 0;
+        goto cleanup;
     }
     
     // 将Ru转换为字节数组以便发送
@@ -380,9 +380,7 @@ int request_registration(int sock, const char *user_id) {
     // 发送ID和Ru给CA
     if (!send_message(sock, CMD_SEND_ID_AND_RU, send_data, SUBJECT_ID_LEN + ru_len)) {
         printf("发送ID和临时公钥失败\n");
-        BN_free(Ku);
-        EC_POINT_free(Ru);
-        return 0;
+        goto cleanup;
     }
     
     // 接收CA发送的证书和部分私钥r
@@ -390,25 +388,19 @@ int request_registration(int sock, const char *user_id) {
     int data_len = recv_message(sock, &cmd, buffer, BUFFER_SIZE);
     if (data_len < 0) {
         printf("接收数据失败\n");
-        BN_free(Ku);
-        EC_POINT_free(Ru);
-        return 0;
+        goto cleanup;
     }
     // 验证命令类型
     if (cmd != CMD_SEND_CERT_AND_R) {
         printf("接收到错误的命令类型: %d\n", cmd);
-        BN_free(Ku);
-        EC_POINT_free(Ru);
-        return 0;
+        goto cleanup;
     }
     // 解析证书和部分私钥r
     ImpCert cert;
     unsigned char r[SM2_PRI_MAX_SIZE];
     if (data_len != sizeof(ImpCert) + SM2_PRI_MAX_SIZE) {
         printf("接收到的数据长度错误: %d\n", data_len);
-        BN_free(Ku);
-        EC_POINT_free(Ru);
-        return 0;
+        goto cleanup;
     }
     memcpy(&cert, buffer, sizeof(ImpCert));
     memcpy(r, buffer + sizeof(ImpCert), SM2_PRI_MAX_SIZE);
@@ -426,20 +418,16 @@ int request_registration(int sock, const char *user_id) {
     // 保存证书供后续使用
     if(!save_cert(&cert, cert_filename)){
         printf("保存证书失败\n");
-        BN_free(Ku);
-        EC_POINT_free(Ru);
-        return 0;
+        goto cleanup;
     }
     
     //--------step3:用户端生成最终的公私钥对-------------
     // 获取隐式证书中的Pu
-    EC_POINT *Pu = EC_POINT_new(group);
-    getPu(&cert, Pu);
-
-    // 打印Pu值，方便调试
-    char *Pu_hex = EC_POINT_point2hex(group, Pu, POINT_CONVERSION_UNCOMPRESSED, NULL);
-    printf("用户端Pu: %s\n", Pu_hex);
-    OPENSSL_free(Pu_hex);
+    Pu = EC_POINT_new(group);
+    if (!getPu(&cert, Pu)) {
+        printf("获取Pu失败\n");
+        goto cleanup;
+    }
     
     // 计算隐式证书哈希值
     unsigned char e[32];
@@ -448,7 +436,10 @@ int request_registration(int sock, const char *user_id) {
     
     // 公钥重构 Qu=e×Pu+Q_ca
     unsigned char Qu[SM2_PUB_MAX_SIZE];
-    rec_pubkey(Qu, e, Pu, Q_ca);
+    if (!rec_pubkey(Qu, e, Pu, Q_ca)) {
+        printf("重构公钥失败\n");
+        goto cleanup;
+    }
 
     // 计算最终私钥d_u=e×Ku+r (mod n)
     unsigned char d_u[SM2_PRI_MAX_SIZE];
@@ -458,10 +449,7 @@ int request_registration(int sock, const char *user_id) {
     // 验证密钥对
     if(!verify_key_pair_bytes(group, Qu, d_u)){
         printf("密钥对验证失败！\n");
-        BN_free(Ku);
-        EC_POINT_free(Ru);
-        EC_POINT_free(Pu);
-        return 0;
+        goto cleanup;
     }
 
     // 更新全局变量
@@ -486,42 +474,35 @@ int request_registration(int sock, const char *user_id) {
         printf("警告：无法保存用户公钥到文件\n");
     }
     
-    // 释放资源
-    BN_free(Ku);
-    EC_POINT_free(Ru);
-    EC_POINT_free(Pu);
     printf("注册过程完成\n");
+    ret = 1;
     
-    return 1;
+cleanup:
+    if (Ku) BN_free(Ku);
+    if (Ru) EC_POINT_free(Ru);
+    if (Pu) EC_POINT_free(Pu);
+    return ret;
 }
 
 int request_cert_update(int sock, const char *user_id) {
     unsigned char buffer[BUFFER_SIZE] = {0};
+    BIGNUM *Ku = NULL;
+    EC_POINT *Ru = NULL;
+    EC_POINT *Pu = NULL;
+    int ret = 0;
 
     //--------step1:用户端-----------
     // 设置新的秘密值Ku
-    BIGNUM *Ku = BN_new();
+    Ku = BN_new();
     BN_rand_range(Ku, order);
-    
-    // 打印Ku值
-    char *Ku_hex = BN_bn2hex(Ku);
-    printf("用户端Ku: %s\n", Ku_hex);
-    OPENSSL_free(Ku_hex);
 
     // 计算临时公钥Ru=Ku*G
-    EC_POINT *Ru = EC_POINT_new(group);
-    if (!Ru || !EC_POINT_mul(group, Ru, Ku, NULL, NULL, NULL)) {
+    Ru = EC_POINT_new(group);
+    if (!EC_POINT_mul(group, Ru, Ku, NULL, NULL, NULL)) {
         printf("计算临时公钥Ru失败\n");
-        BN_free(Ku);
-        if (Ru) EC_POINT_free(Ru);
-        return 0;
+        goto cleanup;
     }
-    
-    // 打印Ru值
-    char *Ru_hex = EC_POINT_point2hex(group, Ru, POINT_CONVERSION_UNCOMPRESSED, NULL);
-    printf("用户端Ru: %s\n", Ru_hex);
-    OPENSSL_free(Ru_hex);
-    
+
     // 将Ru转换为字节数组以便发送
     unsigned char Ru_bytes[SM2_PUB_MAX_SIZE];
     int ru_len = EC_POINT_point2oct(group, Ru, POINT_CONVERSION_UNCOMPRESSED, 
@@ -536,9 +517,7 @@ int request_cert_update(int sock, const char *user_id) {
     unsigned char signature[64];
     if (!sm2_sign(signature, sign_data, SUBJECT_ID_LEN + ru_len, priv_key)) {
         printf("签名失败\n");
-        BN_free(Ku);
-        EC_POINT_free(Ru);
-        return 0;
+        goto cleanup;
     }
     
     // 准备发送的完整数据：ID + Ru + 签名
@@ -549,9 +528,7 @@ int request_cert_update(int sock, const char *user_id) {
     // 发送更新请求给CA
     if (!send_message(sock, CMD_REQUEST_UPDATE, send_data, SUBJECT_ID_LEN + ru_len + 64)) {
         printf("发送更新请求失败\n");
-        BN_free(Ku);
-        EC_POINT_free(Ru);
-        return 0;
+        goto cleanup;
     }
     
     // 接收CA发送的新证书和部分私钥r
@@ -559,17 +536,13 @@ int request_cert_update(int sock, const char *user_id) {
     int data_len = recv_message(sock, &cmd, buffer, BUFFER_SIZE);
     if (data_len < 0) {
         printf("接收数据失败\n");
-        BN_free(Ku);
-        EC_POINT_free(Ru);
-        return 0;
+        goto cleanup;
     }
     
     // 验证命令类型
     if (cmd != CMD_SEND_UPDATED_CERT) {
         printf("接收到错误的命令类型: %d\n", cmd);
-        BN_free(Ku);
-        EC_POINT_free(Ru);
-        return 0;
+        goto cleanup;
     }
     
     // 解析新证书和部分私钥r
@@ -577,9 +550,7 @@ int request_cert_update(int sock, const char *user_id) {
     unsigned char r[SM2_PRI_MAX_SIZE];
     if (data_len != sizeof(ImpCert) + SM2_PRI_MAX_SIZE) {
         printf("接收到的数据长度错误: %d\n", data_len);
-        BN_free(Ku);
-        EC_POINT_free(Ru);
-        return 0;
+        goto cleanup;
     }
     memcpy(&new_cert, buffer, sizeof(ImpCert));
     memcpy(r, buffer + sizeof(ImpCert), SM2_PRI_MAX_SIZE);
@@ -588,18 +559,18 @@ int request_cert_update(int sock, const char *user_id) {
     // 保存新证书供后续使用
     char cert_filename[SUBJECT_ID_SIZE + 5] = {0}; // ID + ".crt"
     sprintf(cert_filename, "%s.crt", user_id);
-    save_cert(&new_cert, cert_filename);
+    if (!save_cert(&new_cert, cert_filename)) {
+        printf("保存新证书失败\n");
+        goto cleanup;
+    }
     
     //--------step3:用户端生成最终的公私钥对-------------
     // 获取隐式证书中的Pu
-    EC_POINT *Pu = EC_POINT_new(group);
-    getPu(&new_cert, Pu);
-    
-    // 打印Pu值，方便调试
-    char *Pu_hex = EC_POINT_point2hex(group, Pu, POINT_CONVERSION_UNCOMPRESSED, NULL);
-    printf("用户端Pu: %s\n", Pu_hex);
-    OPENSSL_free(Pu_hex);
-
+    Pu = EC_POINT_new(group);
+    if (!getPu(&new_cert, Pu)) {
+        printf("获取Pu失败\n");
+        goto cleanup;
+    }
 
     // 计算隐式证书哈希值
     unsigned char e[32];
@@ -608,21 +579,19 @@ int request_cert_update(int sock, const char *user_id) {
     
     // 公钥重构 Qu=e×Pu+Q_ca
     unsigned char Qu[SM2_PUB_MAX_SIZE];
-    rec_pubkey(Qu, e, Pu, Q_ca); 
-    print_hex("用户新Qu", Qu, SM2_PUB_MAX_SIZE);
+    if (!rec_pubkey(Qu, e, Pu, Q_ca)) {
+        printf("重构公钥失败\n");
+        goto cleanup;
+    }
 
     // 计算最终私钥d_u=e×Ku+r (mod n)
     unsigned char d_u[SM2_PRI_MAX_SIZE];
     calculate_r(d_u, e, Ku, r, order);
-    print_hex("用户新d_u", d_u, SM2_PRI_MAX_SIZE);
 
     // 验证密钥对
     if(!verify_key_pair_bytes(group, Qu, d_u)) {
         printf("新密钥对验证失败！\n");
-        BN_free(Ku);
-        EC_POINT_free(Ru);
-        EC_POINT_free(Pu);
-        return 0;
+        goto cleanup;
     }
     
     // 更新全局变量
@@ -653,14 +622,14 @@ int request_cert_update(int sock, const char *user_id) {
         printf("警告：无法保存更新后的用户公钥到文件\n");
     }
     
-    // 释放资源
-    BN_free(Ku);
-    EC_POINT_free(Ru);
-    EC_POINT_free(Pu);
-    
     printf("证书更新过程完成\n");
+    ret = 1;
     
-    return 1;
+cleanup:
+    if (Ku) BN_free(Ku);
+    if (Ru) EC_POINT_free(Ru);
+    if (Pu) EC_POINT_free(Pu);
+    return ret;
 }
 
 int send_signed_message(int sock, const char *user_id, const char *message) {
@@ -778,12 +747,10 @@ int online_csp(int sock, const unsigned char *cert_hash) {
         printf("CA签名验证失败！此响应可能不是来自合法CA\n");
         return -1;
     }
-    
-    // 返回证书状态
+
     return status;
 }
 
-// 请求撤销证书
 int request_cert_revoke(int sock, const char *user_id) {
     // 检查证书和私钥是否已加载
     if (!has_cert) {
