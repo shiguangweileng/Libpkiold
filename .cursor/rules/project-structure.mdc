@@ -13,11 +13,14 @@ libpki是一个轻量级PKI的C语言项目,主要实现了国密算法的证书
   - [gm_crypto.h](mdc:include/gm_crypto.h) - 国密算法接口
   - [imp_cert.h](mdc:include/imp_cert.h) - 证书相关定义和功能
   - [network.h](mdc:include/network.h) - 网络通信接口
-  - [user.h](mdc:include/user.h) - 用户core相关功能接口
+  - [usercore.h](mdc:include/usercore.h) - 用户core相关功能接口
   - [hashmap.h](mdc:include/hashmap.h) - 哈希表实现
   - [crlmanager.h](mdc:include/crlmanager.h) - 证书撤销列表管理器
   
 - `src/` - 源代码实现
 - `server/` - 服务器相关代码
-  - `ca-server/` - CA服务器实现
+  - `ca-server/` - CA服务器实现,用来处理核心逻辑以及和user的交互功能
   - `user-client/` - 用户客户端实现，包括[func_test.c](mdc:server/user-client/func_test.c)功能测试程序
+
+- `webui/` - ca的后台管理界面,使用了vue3前端
+    - [ca_web.c](mdc:webui/ca_web.c) - ca后端,用来和前端页面交互
