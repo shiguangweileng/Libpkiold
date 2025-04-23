@@ -4,7 +4,7 @@ OPENSSL_DIR = /usr/local/openssl
 CFLAGS = -I./include -I$(OPENSSL_DIR)/include -L$(OPENSSL_DIR)/lib64 -l:libcrypto.so.3 -lpthread
 SRC_FILES = $(wildcard src/*.c)
 
-all: ca user auto
+all: ca user test
 
 ca:
 	@echo "正在编译CA服务器..."
@@ -16,10 +16,10 @@ user:
 	$(CC) server/user-client/user.c $(SRC_FILES) $(CFLAGS) -o server/user-client/user
 	@echo "User客户端编译成功！"
 
-auto:
+test:
 	@echo "正在编译自动测试程序..."
-	$(CC) server/user-client/auto_test.c $(SRC_FILES) $(CFLAGS) -o server/user-client/auto_test
-	@echo "自动测试程序编译成功！"
+	$(CC) server/user-client/func_test.c server/user-client/user_lib.c $(SRC_FILES) $(CFLAGS) -o server/user-client/func_test
+	@echo "功能测试程序编译成功！"
 
 web: mongoose
 	@echo "正在编译Web监控程序..."
@@ -36,8 +36,8 @@ mongoose:
 clean:
 	rm -f server/ca-server/ca
 	rm -f server/user-client/user
-	rm -f server/user-client/auto_test
+	rm -f server/user-client/func_test
 	rm -f webmonitor/webmonitor
 	@echo "清理完成！"
 
-.PHONY: all ca user auto web mongoose clean 
+.PHONY: all ca user test web mongoose clean

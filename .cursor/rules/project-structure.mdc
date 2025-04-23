@@ -1,0 +1,23 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+# libpki项目结构
+
+libpki是一个轻量级PKI的C语言项目,主要实现了国密算法的证书管理功能。
+
+## 项目目录结构
+- `include/` - 包含所有头文件
+  - [common.h](mdc:include/common.h) - 通用定义和常量
+  - [gm_crypto.h](mdc:include/gm_crypto.h) - 国密算法接口
+  - [imp_cert.h](mdc:include/imp_cert.h) - 证书相关定义和功能
+  - [network.h](mdc:include/network.h) - 网络通信接口
+  - [user.h](mdc:include/user.h) - 用户core相关功能接口
+  - [hashmap.h](mdc:include/hashmap.h) - 哈希表实现
+  - [crlmanager.h](mdc:include/crlmanager.h) - 证书撤销列表管理器
+  
+- `src/` - 源代码实现
+- `server/` - 服务器相关代码
+  - `ca-server/` - CA服务器实现
+  - `user-client/` - 用户客户端实现，包括[func_test.c](mdc:server/user-client/func_test.c)功能测试程序

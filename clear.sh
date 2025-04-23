@@ -11,7 +11,7 @@ user_client_dir="$SCRIPT_DIR/server/user-client"
 ca_server_whitelist=("UserCerts" "UserData" "ca" "ca_priv.key" "ca_pub.key" "ca.c" "SerialNum.txt")
 
 # 定义user-client目录的白名单文件列表
-user_client_whitelist=("user" "user.c" "ca_pub.key" "auto_test.c" "ca.crt")
+user_client_whitelist=("user" "user.c" "ca.crt" "ca_pub.key" "user_lib.c" "auto_test.c" "func_test.c")
 
 # 删除ca-server目录中不需要的文件
 cd "$ca_server_dir" || { echo "无法进入目录 $ca_server_dir"; exit 1; }
