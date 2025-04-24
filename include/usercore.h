@@ -9,6 +9,7 @@
 
 #define CRL_MANAGER_FILE "CRLManager.dat"
 #define MAX_MESSAGE_SIZE 1024 // 最大消息长度
+#define NETWORK_TIMEOUT 1000  // 网络超时时间（毫秒）
 
 // 定义存储在user.c中的全局变量为外部变量
 extern ImpCert loaded_cert;

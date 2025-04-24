@@ -3,13 +3,14 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/time.h>
+#include <sys/socket.h>
 #include "common.h"
 #include "gm_crypto.h"
 #include "imp_cert.h"
 #include "hashmap.h"
 #include "crlmanager.h"
 #include "network.h"
-#include "user.h"
+#include "usercore.h"
 
 
 //----------------证书处理函数实现-------------------
@@ -410,70 +411,6 @@ int send_signed_message(int sock, const char *user_id, const char *message) {
     }
 }
 
-int online_csp(int sock, const unsigned char *cert_hash) {
-    unsigned char buffer[BUFFER_SIZE] = {0};
-    
-    // 发送证书哈希值到CA进行验证
-    if (!send_message(sock, CMD_VERIFY_CERT, cert_hash, CERT_HASH_SIZE)) {
-        printf("发送证书验证请求失败\n");
-        return -1;
-    }
-    
-    // 接收CA的响应
-    uint8_t cmd;
-    int data_len = recv_message(sock, &cmd, buffer, BUFFER_SIZE);
-    if (data_len < 0) {
-        printf("接收数据失败\n");
-        return -1;
-    }
-    
-    // 验证命令类型
-    if (cmd != CMD_CERT_STATUS) {
-        printf("接收到错误的命令类型: %d\n", cmd);
-        return -1;
-    }
-    
-    // 解析响应数据：状态(1字节) + 时间戳(8字节) + 签名(64字节)
-    if (data_len != 1 + 8 + 64) {
-        printf("接收到的数据长度错误: %d\n", data_len);
-        return -1;
-    }
-    
-    // 提取状态和时间戳
-    uint8_t status = buffer[0];
-    uint64_t timestamp;
-    memcpy(&timestamp, buffer + 1, 8);
-    
-    // 转换为主机字节序
-    timestamp = be64toh(timestamp);
-    
-    // 使用validate_timestamp函数验证时间戳
-    if (!validate_timestamp(timestamp)) {
-        printf("证书状态响应中的时间戳无效\n");
-        return -1;
-    }
-    
-    // 验证CA签名
-    // 签名数据：证书哈希 + 状态 + 时间戳
-    unsigned char signed_data[CERT_HASH_SIZE + 1 + 8];
-    memcpy(signed_data, cert_hash, CERT_HASH_SIZE);
-    signed_data[CERT_HASH_SIZE] = status;
-    uint64_t ts_network = htobe64(timestamp);
-    memcpy(signed_data + CERT_HASH_SIZE + 1, &ts_network, 8);
-    
-    // 提取签名
-    unsigned char signature[64];
-    memcpy(signature, buffer + 1 + 8, 64);
-    
-    // 用CA公钥验证签名
-    if (!sm2_verify(signature, signed_data, CERT_HASH_SIZE + 1 + 8, Q_ca)) {
-        printf("CA签名验证失败！此响应可能不是来自合法CA\n");
-        return -1;
-    }
-
-    return status;
-}
-
 int request_cert_revoke(int sock, const char *user_id) {
     // 检查证书和私钥是否已加载
     if (!has_cert) {
@@ -757,6 +694,90 @@ int sync_crl_with_ca(int sock) {
     
     return 1;
 }
+
+// 证书状态查询函数 - 先尝试在线查询，超时则使用本地查询
+int online_csp(int sock, const unsigned char *cert_hash) {
+    unsigned char buffer[BUFFER_SIZE] = {0};
+    int local_status = 0;
+    
+    // 设置套接字接收超时
+    struct timeval timeout;
+    timeout.tv_sec = NETWORK_TIMEOUT / 1000;
+    timeout.tv_usec = (NETWORK_TIMEOUT % 1000) * 1000;
+    
+    if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0) {
+        printf("设置套接字超时失败，使用本地查询\n");
+        goto use_local;
+    }
+    
+    // 发送证书哈希值到CA进行验证
+    if (!send_message(sock, CMD_VERIFY_CERT, cert_hash, CERT_HASH_SIZE)) {
+        printf("发送证书验证请求失败\n");
+        goto use_local;
+    }
+    
+    // 接收CA的响应，如果超时会自动返回错误
+    uint8_t cmd;
+    int data_len = recv_message(sock, &cmd, buffer, BUFFER_SIZE);
+    
+    if (data_len < 0) {
+        printf("接收数据超时或失败，使用本地查询\n");
+        goto use_local;
+    }
+    
+    // 验证命令类型
+    if (cmd != CMD_CERT_STATUS) {
+        printf("接收到错误的命令类型: %d，使用本地查询\n", cmd);
+        goto use_local;
+    }
+    
+    // 解析响应数据：状态(1字节) + 时间戳(8字节) + 签名(64字节)
+    if (data_len != 1 + 8 + 64) {
+        printf("接收到的数据长度错误: %d，使用本地查询\n", data_len);
+        goto use_local;
+    }
+    
+    // 提取状态和时间戳
+    uint8_t status = buffer[0];
+    uint64_t timestamp;
+    memcpy(&timestamp, buffer + 1, 8);
+    
+    // 转换为主机字节序
+    timestamp = be64toh(timestamp);
+    
+    // 使用validate_timestamp函数验证时间戳
+    if (!validate_timestamp(timestamp)) {
+        printf("证书状态响应中的时间戳无效，使用本地查询\n");
+        goto use_local;
+    }
+    
+    // 验证CA签名
+    // 签名数据：证书哈希 + 状态 + 时间戳
+    unsigned char signed_data[CERT_HASH_SIZE + 1 + 8];
+    memcpy(signed_data, cert_hash, CERT_HASH_SIZE);
+    signed_data[CERT_HASH_SIZE] = status;
+    uint64_t ts_network = htobe64(timestamp);
+    memcpy(signed_data + CERT_HASH_SIZE + 1, &ts_network, 8);
+    
+    // 提取签名
+    unsigned char signature[64];
+    memcpy(signature, buffer + 1 + 8, 64);
+    
+    // 用CA公钥验证签名
+    if (!sm2_verify(signature, signed_data, CERT_HASH_SIZE + 1 + 8, Q_ca)) {
+        printf("CA签名验证失败！此响应可能不是来自合法CA，使用本地查询\n");
+        goto use_local;
+    }
+    
+    printf("在线查询结果: 证书%s\n", status ? "有效" : "无效（已撤销）");
+    return 1;
+    
+use_local:
+    local_status = local_csp(cert_hash);
+    printf("本地查询结果: 证书%s\n", local_status ? "有效" : "无效（已撤销）");
+    return 1;
+}
+
 
 // 本地证书状态检查
 int local_csp(const unsigned char *cert_hash) {

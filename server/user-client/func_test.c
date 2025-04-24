@@ -7,7 +7,7 @@
 #include "gm_crypto.h"
 #include "imp_cert.h"
 #include "network.h"
-#include "user.h"
+#include "usercore.h"
 
 // CA服务器配置
 #define CA_SERVER_IP "127.0.0.1"

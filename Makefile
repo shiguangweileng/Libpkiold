@@ -18,7 +18,7 @@ user:
 
 test:
 	@echo "正在编译自动测试程序..."
-	$(CC) server/user-client/func_test.c server/user-client/user_lib.c $(SRC_FILES) $(CFLAGS) -o server/user-client/func_test
+	$(CC) server/user-client/func_test.c server/user-client/usercore.c $(SRC_FILES) $(CFLAGS) -o server/user-client/func_test
 	@echo "功能测试程序编译成功！"
 
 web: mongoose
