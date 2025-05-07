@@ -20,7 +20,10 @@ libpki是一个轻量级PKI的C语言项目,主要实现了国密算法的证书
 - `src/` - 源代码实现
 - `server/` - 服务器相关代码
   - `ca-server/` - CA服务器实现,用来处理核心逻辑以及和user的交互功能
+      `ca-server/UserCerts` - 存放ca生成的证书,形如U0000001.crt
+      `ca-server/UserData` - 存放ca本地生成的用户公私钥文件,形如U0000001_pub.key,U0000001_priv.key
   - `user-client/` - 用户客户端实现，包括[func_test.c](mdc:server/user-client/func_test.c)功能测试程序
 
 - `webui/` - ca的后台管理界面,使用了vue3前端
-    - [ca_web.c](mdc:webui/ca_web.c) - ca后端,用来和前端页面交互
+
+- [ca_web.c](mdc:webui/ca_web.c) - ca后端程序,与 [ca.c](mdc:server/ca-server/ca.c) 进行socket通信,与vue前端提供API接口

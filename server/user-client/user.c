@@ -1036,13 +1036,10 @@ int online_csp(int sock, const unsigned char *cert_hash) {
         printf("CA签名验证失败！此响应可能不是来自合法CA，使用本地查询\n");
         goto use_local;
     }
-    
-    printf("在线查询结果: 证书%s\n", status ? "有效" : "无效（已撤销）");
     return status;
     
 use_local:
     // 使用本地CRL查询证书状态
     local_status = local_csp(cert_hash);
-    printf("本地查询结果: 证书%s\n", local_status ? "有效" : "无效（已撤销）");
     return local_status;
 }

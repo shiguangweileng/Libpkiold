@@ -1,0 +1,23 @@
+{
+  "name": "webui",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "build": "vite build",
+    "preview": "vite preview",
+    "ca": "cd ../server/ca-server && ./ca",
+    "ca-web": "cd ../ && ./ca_web",
+    "start-all": "concurrently -k -n \"前端,CA,CA_WEB\" -c \"blue,green,yellow\" \"npm run dev\" \"npm run ca\" \"npm run ca-web\""
+  },
+  "dependencies": {
+    "vue": "^3.5.13"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.2.3",
+    "concurrently": "^8.2.2",
+    "vite": "^6.2.4",
+    "vite-plugin-vue-devtools": "^7.7.2"
+  }
+}

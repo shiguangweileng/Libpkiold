@@ -9,6 +9,7 @@
         "imp_cert.h": "c",
         "gm_crypto.h": "c",
         "stdlib.h": "c",
-        "time.h": "c"
+        "time.h": "c",
+        "network.h": "c"
     }
 }

@@ -20,6 +20,21 @@
 #define SERIAL_NUM_FILE "SerialNum.txt"  // 序列号持久化文件
 #define CRL_MANAGER_FILE "CRLManager.dat" // CRL管理器文件
 
+// Web通信相关定义
+#define WEB_PORT 8001   // 与ca_web通信的端口
+// Web通信协议命令
+#define WEB_CMD_GET_USERS      0x81    // ca_web请求获取用户列表
+#define WEB_CMD_USER_LIST      0x82    // ca向ca_web发送用户列表
+#define WEB_CMD_GET_CERT       0x83    // ca_web请求获取特定用户证书
+#define WEB_CMD_CERT_DATA      0x84    // ca向ca_web发送证书数据
+#define WEB_CMD_GET_CRL        0x85    // ca_web请求获取证书撤销列表
+#define WEB_CMD_CRL_DATA       0x86    // ca向ca_web发送证书撤销列表数据
+#define WEB_CMD_CLEANUP_CERTS  0x87    // ca_web请求清理过期证书
+#define WEB_CMD_CLEANUP_RESULT 0x88    // ca向ca_web发送清理结果
+#define WEB_CMD_LOCAL_GEN_CERT 0x89    // ca_web请求本地生成证书
+#define WEB_CMD_LOCAL_UPD_CERT 0x8A    // ca_web请求本地更新证书
+#define WEB_CMD_LOCAL_RESULT   0x8B    // ca向ca_web发送本地操作结果
+
 unsigned char d_ca[SM2_PRI_MAX_SIZE];
 unsigned char Q_ca[SM2_PUB_MAX_SIZE];
 
@@ -31,10 +46,15 @@ unsigned int current_serial_num = 1;  // 当前证书序列号，默认从1开�
 // 线程相关
 pthread_t server_thread;           // 服务器监听线程
 volatile int server_running = 0;   // 服务器运行状态标志
+pthread_t web_server_thread;       // Web服务器监听线程
+volatile int web_server_running = 0; // Web服务器运行状态标志
+pthread_mutex_t user_map_mutex = PTHREAD_MUTEX_INITIALIZER; // 用户表互斥锁
 
 // 网络通信
 void handle_client(int client_socket);
 void* server_thread_func(void* arg); // 服务器监听线程函数
+void* web_server_thread_func(void* arg); // Web服务器监听线程函数
+void handle_web_client(int client_socket); // 处理Web客户端请求
 
 // 证书处理
 void handle_registration(int client_socket, const unsigned char *buffer, int data_len);
@@ -45,6 +65,15 @@ void handle_cert_revoke(int client_socket, const unsigned char *buffer, int data
 void handle_crl_update(int client_socket, const unsigned char *buffer, int data_len);
 int local_generate_cert(const char *subject_id);
 int local_update_cert(const char *subject_id);
+int cleanup_expired_certificates();
+
+// Web通信处理
+void handle_web_get_users(int client_socket);
+void handle_web_get_cert(int client_socket, const unsigned char *buffer, int data_len);
+void handle_web_get_crl(int client_socket);
+void handle_web_cleanup_certs(int client_socket);
+void handle_web_local_gen_cert(int client_socket, const unsigned char *buffer, int data_len);
+void handle_web_local_upd_cert(int client_socket, const unsigned char *buffer, int data_len);
 
 // 用户数据管理
 int check_user_exists(const char *subject_id);
@@ -69,6 +98,39 @@ void run_online_mode();
 // 调试功能
 void debug_remove_cert();
 
+// 清理过期证书函数实现
+int cleanup_expired_certificates() {
+    time_t current_time = time(NULL);
+    int cleaned_count = 0;
+    int i;
+    pthread_mutex_lock(&user_map_mutex);  // 复用user_map_mutex锁
+    
+    // 遍历CRL管理器中的节点并清理过期的证书
+    for (i = 0; i < crl_manager->base_v; i++) {
+        if (crl_manager->nodes[i].is_valid && crl_manager->nodes[i].hash) {
+            time_t *expire_time = (time_t *)hashmap_get(crl_map, crl_manager->nodes[i].hash);
+            if (expire_time && *expire_time < current_time) {
+                hashmap_remove(crl_map, crl_manager->nodes[i].hash);
+                CRLManager_remove_node(crl_manager, i);
+                cleaned_count++;
+            }
+        }
+    }
+    // 解锁CRL相关结构
+    pthread_mutex_unlock(&user_map_mutex);
+    
+    // 保存更改
+    if (!crl_hashmap_save(crl_map, CRL_FILE)) {
+        printf("保存CRL列表失败！\n");
+    }
+    
+    if (!CRLManager_save_to_file(crl_manager, CRL_MANAGER_FILE)) {
+        printf("保存CRL管理器失败！\n");
+    }
+    
+    return cleaned_count;
+}
+
 int ensure_directory_exists(const char *dir_path) {
     struct stat st = {0};
     if (stat(dir_path, &st) == -1) {
@@ -83,14 +145,11 @@ int ensure_directory_exists(const char *dir_path) {
 }
 
 int main() {
-    int mode_choice = 0;
-    
     if(!CA_init(Q_ca, d_ca)){
         printf("CA初始化失败！\n");
         return -1;
     }
     
-    // 确保必要的目录存在
     if (!ensure_directory_exists(USERDATA_DIR) || 
         !ensure_directory_exists(USERCERTS_DIR)) {
         printf("无法确保必要目录存在！\n");
@@ -99,7 +158,6 @@ int main() {
     
     current_serial_num = load_serial_num();
     
-    // 加载用户列表到哈希表中
     user_map = ul_hashmap_load(USERLIST_FILE);
     if (!user_map) {
         printf("无法初始化用户哈希表！\n");
@@ -107,7 +165,6 @@ int main() {
         return -1;
     }
 
-    // 加载证书撤销列表到哈希表中
     crl_map = crl_hashmap_load(CRL_FILE);
     if (!crl_map) {
         printf("无法初始化CRL哈希表！\n");
@@ -116,7 +173,6 @@ int main() {
         return -1;
     }
     
-    // 加载或初始化CRLManager
     crl_manager = CRLManager_load_from_file(CRL_MANAGER_FILE);
     if (!crl_manager) {
         crl_manager = CRLManager_init(512, 512);
@@ -129,32 +185,9 @@ int main() {
         }
     }
     
-    // 选择运行模式
-    printf("请选择CA服务器运行模式:\n");
-    printf("1. 本地模式 - 提供本地证书生成和更新功能\n");
-    printf("2. 线上模式 - 启动监听服务器与用户交互\n");
-    printf("请输入选择: ");
+    // 直接进入线上模式
+    run_online_mode();
     
-    if (scanf("%d", &mode_choice) != 1) {
-        printf("输入错误\n");
-        hashmap_destroy(crl_map);
-        hashmap_destroy(user_map);
-        sm2_params_cleanup();
-        return -1;
-    }
-    
-    clear_input_buffer();
-    
-    // 根据选择进入相应模式
-    if (mode_choice == 1) {
-        run_local_mode();
-    } else if (mode_choice == 2) {
-        run_online_mode();
-    } else {
-        printf("无效的选择\n");
-    }
-    
-    // 程序结束时清理资源
     hashmap_destroy(user_map);
     hashmap_destroy(crl_map);
     if (crl_manager) {
@@ -208,13 +241,11 @@ void handle_client(int client_socket) {
 
 // ---- 证书处理相关函数 ----
 void handle_registration(int client_socket, const unsigned char *buffer, int data_len) {
-    // 验证接收的数据长度
     if (data_len < SUBJECT_ID_LEN + SM2_PUB_MAX_SIZE) {
         printf("接收到的数据长度错误\n");
         return;
     }
     
-    // 先提取用户ID（前8个字节）
     char subject_id[SUBJECT_ID_SIZE] = {0}; // 确保null结尾
     memcpy(subject_id, buffer, SUBJECT_ID_LEN);
 
@@ -327,20 +358,17 @@ cleanup:
 }
 
 void handle_cert_update(int client_socket, const unsigned char *buffer, int data_len) {
-    // 为资源分配变量
     EC_POINT *Ru = NULL;
     EC_POINT *Pu = NULL;
     EC_POINT *new_Pu = NULL;
     BIGNUM *k = NULL;
     int ret = 0;
     
-    // 验证接收的数据长度
     if (data_len < SUBJECT_ID_LEN + SM2_PUB_MAX_SIZE + 64) {
         printf("接收到的数据长度错误\n");
         return;
     }
     
-    // 先提取用户ID（前8个字节）
     char subject_id[SUBJECT_ID_SIZE] = {0};
     memcpy(subject_id, buffer, SUBJECT_ID_LEN);
     if (strlen(subject_id) != 8) {
@@ -349,13 +377,11 @@ void handle_cert_update(int client_socket, const unsigned char *buffer, int data
     }
     printf("%s---证书更新\n", subject_id);
     
-    // 检查用户是否存在
     if (!check_user_exists(subject_id)) {
         printf("用户ID '%s' 不存在，拒绝更新\n", subject_id);
         return;
     }
     
-    // 加载用户的现有证书
     char cert_filename[SUBJECT_ID_SIZE + 15] = {0};
     sprintf(cert_filename, "%s/%s.crt", USERCERTS_DIR, subject_id);
     
@@ -365,7 +391,6 @@ void handle_cert_update(int client_socket, const unsigned char *buffer, int data
         return;
     }
     
-    // 验证证书有效性
     if (!validate_cert(&old_cert)) {
         printf("用户证书已过期，请重新注册\n");
         return;
@@ -405,7 +430,6 @@ void handle_cert_update(int client_socket, const unsigned char *buffer, int data
         printf("重构用户公钥失败\n");
         goto cleanup;
     }
-    //print_hex("重构用户公钥Qu", Qu, SM2_PUB_MAX_SIZE);
     
     // 提取签名数据和签名
     unsigned char sign_data[SUBJECT_ID_SIZE + SM2_PUB_MAX_SIZE];
@@ -546,7 +570,6 @@ void handle_message(int client_socket, const unsigned char *buffer, int data_len
     memcpy(sender_id, cert.SubjectID, SUBJECT_ID_LEN);
     printf("收到 %s 的消息\n", sender_id);
     
-    // 检验证书是否过期
     if (!validate_cert(&cert)) {
         printf("拒绝消息：证书已过期\n");
         free(message);
@@ -943,9 +966,6 @@ int local_generate_cert(const char *subject_id) {
         printf("保存用户数据失败！\n");
         goto cleanup;
     }
-    
-    printf("用户 '%s' 成功注册并保存到UserList\n", subject_id);
-
     // 计算部分私钥r=e×k+d_ca (mod n)
     unsigned char r[SM2_PRI_MAX_SIZE];
     calculate_r(r, cert_hash, k, d_ca, order);
@@ -963,9 +983,7 @@ int local_generate_cert(const char *subject_id) {
         printf("密钥对验证失败！\n");
         goto cleanup;
     }
-    
-    printf("密钥对验证成功！\n");
-    
+
     // 保存用户私钥
     char priv_key_filename[100] = {0};
     sprintf(priv_key_filename, "%s/%s_priv.key", USERDATA_DIR, subject_id);
@@ -988,7 +1006,7 @@ int local_generate_cert(const char *subject_id) {
     } else {
         printf("警告：无法保存用户公钥到文件\n");
     }
-    
+    printf("用户 '%s' 本地证书注册成功\n", subject_id);
     printf("--------------------------------\n");
     ret = 1;
     
@@ -1346,9 +1364,7 @@ void run_local_mode() {
 }
 
 void run_online_mode() {
-    int server_fd;
-    int choice = 0;
-    char input_buffer[128] = {0};
+    int server_fd, web_server_fd;
     
     printf("===== CA服务器-线上模式 =====\n");
     
@@ -1358,56 +1374,49 @@ void run_online_mode() {
         return;
     }
     
+    // Web服务器初始化
+    web_server_fd = setup_server(WEB_PORT);
+    if (web_server_fd < 0) {
+        close(server_fd);
+        return;
+    }
+    
     // 启动服务器监听线程
     server_running = 1;
     if (pthread_create(&server_thread, NULL, server_thread_func, &server_fd) != 0) {
         perror("创建服务器线程失败");
         close(server_fd);
+        close(web_server_fd);
+        return;
+    }
+    
+    // 启动Web服务器监听线程
+    web_server_running = 1;
+    if (pthread_create(&web_server_thread, NULL, web_server_thread_func, &web_server_fd) != 0) {
+        perror("创建Web服务器线程失败");
+        server_running = 0;
+        pthread_join(server_thread, NULL);
+        close(server_fd);
+        close(web_server_fd);
         return;
     }
     
     printf("CA服务器已成功启动\n");
+    printf("用户通信端口: %d, Web通信端口: %d\n", PORT, WEB_PORT);
+    printf("按Ctrl+C退出服务器\n");
     
-    // 主线程显示菜单并处理用户输入
+    // 主线程等待用户中断
     while (server_running) {
-        printf("\n===== CA服务器控制菜单 =====\n");
-        printf("1. 删除证书调试\n");
-        printf("0. 退出服务器\n");
-        printf("请输入选择: ");
-        
-        if (fgets(input_buffer, sizeof(input_buffer), stdin) == NULL) {
-            continue;
-        }
-        
-        // 去除输入中的换行符
-        input_buffer[strcspn(input_buffer, "\n")] = 0;
-        
-        if (sscanf(input_buffer, "%d", &choice) != 1) {
-            printf("输入错误，请重新输入\n");
-            continue;
-        }
-        
-        switch (choice) {
-            case 1:
-                debug_remove_cert();
-                break;
-                
-            case 0:
-                server_running = 0;
-                printf("正在关闭服务器...\n");
-                break;
-                
-            default:
-                printf("无效的选择，请重新输入\n");
-                break;
-        }
+        sleep(1);
     }
     
     // 等待服务器线程结束
     pthread_join(server_thread, NULL);
+    pthread_join(web_server_thread, NULL);
     
     // 关闭服务器socket
     close(server_fd);
+    close(web_server_fd);
     printf("CA服务器已关闭\n");
 }
 
@@ -1482,14 +1491,276 @@ void debug_remove_cert() {
     printf("===========================\n");
 }
 
-// 服务器监听线程函数
+// Web服务器监听线程函数
+void* web_server_thread_func(void* arg) {
+    int server_fd = *((int*)arg);
+    int client_socket;
+    struct sockaddr_in address;
+    int addrlen = sizeof(address);
+    
+    while(web_server_running) {
+        // 接受客户端连接（阻塞模式）
+        client_socket = accept(server_fd, (struct sockaddr *)&address, (socklen_t*)&addrlen);
+        if (client_socket < 0) {
+            // 当web_server_running变为0时，可能会返回错误，忽略它
+            if (!web_server_running) break;
+            perror("接受Web连接失败");
+            continue;
+        }
+        
+        handle_web_client(client_socket);
+        
+        // 不关闭与ca_web的连接，保持长连接
+    }
+    
+    printf("Web监听线程已退出\n");
+    return NULL;
+}
+
+// 处理来自ca_web的客户端请求
+void handle_web_client(int client_socket) {
+    unsigned char buffer[BUFFER_SIZE] = {0};
+    uint8_t cmd;
+    int data_len;
+    
+    while(web_server_running) {
+        // 接收命令
+        data_len = recv_message(client_socket, &cmd, buffer, BUFFER_SIZE);
+        if (data_len < 0) {
+            printf("接收ca_web消息失败，连接可能已断开\n");
+            close(client_socket);
+            return;
+        }
+        
+        // 处理命令
+        switch (cmd) {
+            case WEB_CMD_GET_USERS:
+                handle_web_get_users(client_socket);
+                break;
+                
+            case WEB_CMD_GET_CERT:
+                handle_web_get_cert(client_socket, buffer, data_len);
+                break;
+                
+            case WEB_CMD_GET_CRL:
+                handle_web_get_crl(client_socket);
+                break;
+                
+            case WEB_CMD_CLEANUP_CERTS:
+                handle_web_cleanup_certs(client_socket);
+                break;
+                
+            case WEB_CMD_LOCAL_GEN_CERT:
+                handle_web_local_gen_cert(client_socket, buffer, data_len);
+                break;
+                
+            case WEB_CMD_LOCAL_UPD_CERT:
+                handle_web_local_upd_cert(client_socket, buffer, data_len);
+                break;
+                
+            default:
+                printf("收到未知Web命令: 0x%02X\n", cmd);
+                break;
+        }
+    }
+}
+
+// 处理获取用户列表的请求
+void handle_web_get_users(int client_socket) {
+    int user_count = 0;
+    unsigned char *response_data = NULL;
+    int response_len = 0;
+    int offset = 0;
+    
+    // 锁定用户哈希表，防止在读取过程中被修改
+    pthread_mutex_lock(&user_map_mutex);
+    
+    // 计算用户数量
+    user_count = user_map->count;
+    
+    // 准备响应数据：用户数量(4字节) + 多个(用户ID(9字节) + 证书哈希(32字节))
+    response_len = sizeof(int) + user_count * (SUBJECT_ID_SIZE + CERT_HASH_SIZE);
+    response_data = (unsigned char *)malloc(response_len);
+    
+    if (!response_data) {
+        pthread_mutex_unlock(&user_map_mutex);
+        printf("内存分配失败\n");
+        return;
+    }
+    
+    // 写入用户数量
+    memcpy(response_data, &user_count, sizeof(int));
+    offset = sizeof(int);
+    
+    // 遍历哈希表，将所有用户ID和证书哈希写入响应
+    for (int i = 0; i < user_map->size; i++) {
+        hashmap_entry* entry = user_map->entries[i];
+        while (entry) {
+            // 写入用户ID
+            memcpy(response_data + offset, entry->key, SUBJECT_ID_SIZE);
+            offset += SUBJECT_ID_SIZE;
+            
+            // 写入证书哈希
+            memcpy(response_data + offset, entry->value, CERT_HASH_SIZE);
+            offset += CERT_HASH_SIZE;
+            
+            entry = entry->next;
+        }
+    }
+    
+    // 解锁用户哈希表
+    pthread_mutex_unlock(&user_map_mutex);
+    
+    // 发送响应
+    if (!send_message(client_socket, WEB_CMD_USER_LIST, response_data, response_len)) {
+        printf("发送用户列表失败\n");
+    }
+    
+    free(response_data);
+}
+
+// 处理获取单个用户证书的请求
+void handle_web_get_cert(int client_socket, const unsigned char *buffer, int data_len) {
+    // 验证数据长度
+    if (data_len < SUBJECT_ID_SIZE) {
+        printf("接收到的数据长度错误，无法识别用户ID\n");
+        // 发送空数据表示错误
+        send_message(client_socket, WEB_CMD_CERT_DATA, NULL, 0);
+        return;
+    }
+    
+    // 提取用户ID
+    char subject_id[SUBJECT_ID_SIZE] = {0};
+    memcpy(subject_id, buffer, SUBJECT_ID_SIZE - 1); // 确保null结尾
+    
+    // 检查用户是否存在
+    if (!check_user_exists(subject_id)) {
+        printf("用户ID '%s' 不存在\n", subject_id);
+        // 发送空数据表示错误
+        send_message(client_socket, WEB_CMD_CERT_DATA, NULL, 0);
+        return;
+    }
+    
+    // 加载用户证书
+    char cert_filename[SUBJECT_ID_SIZE + 15] = {0};
+    sprintf(cert_filename, "%s/%s.crt", USERCERTS_DIR, subject_id);
+    
+    ImpCert cert;
+    if (!load_cert(&cert, cert_filename)) {
+        printf("无法加载用户证书: %s\n", cert_filename);
+        // 发送空数据表示错误
+        send_message(client_socket, WEB_CMD_CERT_DATA, NULL, 0);
+        return;
+    }
+    
+    // 提取证书哈希
+    unsigned char cert_hash[32];
+    sm3_hash((const unsigned char *)&cert, sizeof(ImpCert), cert_hash);
+    
+    // 检查证书是否在撤销列表中
+    int cert_revoked = check_cert_in_crl(cert_hash);
+    
+    // 检查证书是否有效
+    int cert_valid = validate_cert(&cert) && !cert_revoked;
+    
+    // 提取时间戳
+    time_t start_time, end_time;
+    memcpy(&start_time, cert.Validity, sizeof(time_t));
+    memcpy(&end_time, cert.Validity + sizeof(time_t), sizeof(time_t));
+    
+    // 组装响应数据
+    // 格式：证书结构体 + 哈希值(32字节) + 有效性标志(1字节) + 撤销标志(1字节)
+    unsigned char response[sizeof(ImpCert) + 32 + 1 + 1];
+    
+    // 复制证书数据
+    memcpy(response, &cert, sizeof(ImpCert));
+    
+    // 添加证书哈希
+    memcpy(response + sizeof(ImpCert), cert_hash, 32);
+    
+    // 添加有效性标志
+    response[sizeof(ImpCert) + 32] = cert_valid ? 1 : 0;
+    
+    // 添加撤销标志
+    response[sizeof(ImpCert) + 32 + 1] = cert_revoked ? 1 : 0;
+    
+    // 发送响应
+    if (!send_message(client_socket, WEB_CMD_CERT_DATA, response, sizeof(response))) {
+        printf("发送证书数据失败\n");
+    }
+}
+
+// 处理获取CRL列表的请求
+void handle_web_get_crl(int client_socket) {
+    int crl_count = 0;
+    unsigned char *response_data = NULL;
+    int response_len = 0;
+    int offset = 0;
+    
+    // 锁定CRL哈希表，防止在读取过程中被修改
+    pthread_mutex_lock(&user_map_mutex);  // 复用user_map_mutex锁
+    
+    // 计算CRL条目数量
+    crl_count = crl_map->count;
+    
+    // 准备响应数据：基础版本号(4字节) + 删除版本号(4字节) + CRL条目数量(4字节) + 多个(证书哈希(32字节) + 到期时间(8字节))
+    response_len = sizeof(int) * 3 + crl_count * (CERT_HASH_SIZE + sizeof(time_t));
+    response_data = (unsigned char *)malloc(response_len);
+    
+    if (!response_data) {
+        pthread_mutex_unlock(&user_map_mutex);
+        printf("内存分配失败\n");
+        return;
+    }
+    
+    // 写入基础版本号
+    memcpy(response_data, &crl_manager->base_v, sizeof(int));
+    offset += sizeof(int);
+    
+    // 写入删除版本号
+    memcpy(response_data + offset, &crl_manager->removed_v, sizeof(int));
+    offset += sizeof(int);
+    
+    // 写入CRL条目数量
+    memcpy(response_data + offset, &crl_count, sizeof(int));
+    offset += sizeof(int);
+    
+    // 遍历哈希表，将所有证书哈希和到期时间写入响应
+    for (int i = 0; i < crl_map->size; i++) {
+        hashmap_entry* entry = crl_map->entries[i];
+        while (entry) {
+            // 写入证书哈希
+            memcpy(response_data + offset, entry->key, CERT_HASH_SIZE);
+            offset += CERT_HASH_SIZE;
+            
+            // 写入到期时间
+            time_t expire_time = *(time_t*)entry->value;
+            memcpy(response_data + offset, &expire_time, sizeof(time_t));
+            offset += sizeof(time_t);
+            
+            entry = entry->next;
+        }
+    }
+    
+    // 解锁CRL哈希表
+    pthread_mutex_unlock(&user_map_mutex);
+    
+    // 发送响应
+    if (!send_message(client_socket, WEB_CMD_CRL_DATA, response_data, response_len)) {
+        printf("发送CRL列表失败\n");
+    }
+    
+    free(response_data);
+}
+
+// 常规用户通信线程函数
 void* server_thread_func(void* arg) {
     int server_fd = *((int*)arg);
     int client_socket;
     struct sockaddr_in address;
     int addrlen = sizeof(address);
     
-    printf("监听线程已启动，等待客户端连接...\n");
+    printf("用户监听线程已启动，等待客户端连接...\n");
     
     while(server_running) {
         // 接受客户端连接（阻塞模式）
@@ -1499,7 +1770,11 @@ void* server_thread_func(void* arg) {
             perror("接受连接失败");
             continue;
         }
+        
+        // 添加锁保护处理用户请求时的用户表访问
+        pthread_mutex_lock(&user_map_mutex);
         handle_client(client_socket);
+        pthread_mutex_unlock(&user_map_mutex);
         
         // 保存信息
         ul_hashmap_save(user_map, USERLIST_FILE);
@@ -1510,7 +1785,104 @@ void* server_thread_func(void* arg) {
         close(client_socket);
     }
     
-    printf("监听线程已退出\n");
+    printf("用户监听线程已退出\n");
     return NULL;
+}
+
+// 处理从ca_web收到的清理过期证书请求
+void handle_web_cleanup_certs(int client_socket) {
+    printf("收到清理过期证书请求\n");
+    int cleaned_count = cleanup_expired_certificates();
+    
+    unsigned char response[sizeof(int)];
+    memcpy(response, &cleaned_count, sizeof(int));
+    
+    if (!send_message(client_socket, WEB_CMD_CLEANUP_RESULT, response, sizeof(int))) {
+        printf("发送清理结果失败\n");
+    }
+}
+
+// 处理从ca_web收到的本地证书生成请求
+void handle_web_local_gen_cert(int client_socket, const unsigned char *buffer, int data_len) {
+    if (data_len < SUBJECT_ID_SIZE) {
+        printf("接收到的数据长度错误，无法识别用户ID\n");
+        // 发送失败结果
+        unsigned char response = 0; // 0表示失败
+        send_message(client_socket, WEB_CMD_LOCAL_RESULT, &response, 1);
+        return;
+    }
+    char subject_id[SUBJECT_ID_SIZE] = {0};
+    memcpy(subject_id, buffer, SUBJECT_ID_SIZE - 1); // 确保null结尾
+    // 锁定用户哈希表
+    pthread_mutex_lock(&user_map_mutex);
+    
+    // 调用本地证书生成函数
+    int result = local_generate_cert(subject_id);
+    
+    // 保存信息
+    if(!ul_hashmap_save(user_map, USERLIST_FILE)){
+        printf("保存用户列表失败！\n");
+    }
+    if(!crl_hashmap_save(crl_map, CRL_FILE)){
+        printf("保存CRL列表失败！\n");
+    }
+    if(!save_serial_num()){
+        printf("保存序列号失败！\n");
+    }
+    if(!CRLManager_save_to_file(crl_manager, CRL_MANAGER_FILE)){
+        printf("保存CRL管理器失败！\n");
+    }
+    
+    // 解锁用户哈希表
+    pthread_mutex_unlock(&user_map_mutex);
+    
+    // 发送结果
+    unsigned char response = result ? 1 : 0; // 1表示成功，0表示失败
+    send_message(client_socket, WEB_CMD_LOCAL_RESULT, &response, 1);
+}
+
+// 处理从ca_web收到的本地证书更新请求
+void handle_web_local_upd_cert(int client_socket, const unsigned char *buffer, int data_len) {
+    // 验证数据长度
+    if (data_len < SUBJECT_ID_SIZE) {
+        printf("接收到的数据长度错误，无法识别用户ID\n");
+        // 发送失败结果
+        unsigned char response = 0; // 0表示失败
+        send_message(client_socket, WEB_CMD_LOCAL_RESULT, &response, 1);
+        return;
+    }
+    
+    // 提取用户ID
+    char subject_id[SUBJECT_ID_SIZE] = {0};
+    memcpy(subject_id, buffer, SUBJECT_ID_SIZE - 1); // 确保null结尾
+    
+    printf("收到web请求，为用户 '%s' 本地更新证书\n", subject_id);
+    
+    // 锁定用户哈希表
+    pthread_mutex_lock(&user_map_mutex);
+    
+    // 调用本地证书更新函数
+    int result = local_update_cert(subject_id);
+    
+    // 保存信息
+    if(!ul_hashmap_save(user_map, USERLIST_FILE)){
+        printf("保存用户列表失败！\n");
+    }
+    if(!crl_hashmap_save(crl_map, CRL_FILE)){
+        printf("保存CRL列表失败！\n");
+    }
+    if(!save_serial_num()){
+        printf("保存序列号失败！\n");
+    }
+    if(!CRLManager_save_to_file(crl_manager, CRL_MANAGER_FILE)){
+        printf("保存CRL管理器失败！\n");
+    }
+    
+    // 解锁用户哈希表
+    pthread_mutex_unlock(&user_map_mutex);
+    
+    // 发送结果
+    unsigned char response = result ? 1 : 0; // 1表示成功，0表示失败
+    send_message(client_socket, WEB_CMD_LOCAL_RESULT, &response, 1);
 }
 

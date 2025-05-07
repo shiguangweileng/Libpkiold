@@ -310,11 +310,7 @@ int test_cert_status_check() {
         return 0;
     }
     online_status = online_csp(sock, revoked_cert_hash);
-    if (online_status >= 0) {
-        printf("online_csp:%s\n", online_status ? "有效" : "无效（已撤销）");
-    } else {
-        printf("online_csp: 查询失败\n");
-    }
+    printf("online_csp:%s\n", online_status ? "有效" : "无效（已撤销）");
     close(sock);
     local_status = local_csp(revoked_cert_hash);
     printf("local_csp:%s\n", local_status ? "有效" : "无效（已撤销）");
@@ -348,11 +344,7 @@ int test_cert_status_check() {
         return 0;
     }
     online_status = online_csp(sock, revoked_cert_hash);
-    if (online_status >= 0) {
-        printf("online_csp:%s\n", online_status ? "有效" : "无效（已撤销）");
-    } else {
-        printf("online_csp: 查询失败\n");
-    }
+    printf("online_csp:%s\n", online_status ? "有效" : "无效（已撤销）");
     close(sock);
     local_status = local_csp(revoked_cert_hash);
     printf("local_csp:%s\n", local_status ? "有效" : "无效（已撤销）");
