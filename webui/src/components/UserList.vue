@@ -60,10 +60,20 @@ function formatDateTime(date) {
   return new Date(date).toLocaleString('zh-CN', options)
 }
 
-// 时间戳格式化
+// 格式化时间戳
 function formatTimestamp(timestamp) {
   const date = new Date(timestamp * 1000)
   return formatDateTime(date)
+}
+
+// 简单的加载提示
+function showLoadingToast(message) {
+  // 这里仅用console.log记录，可以根据实际UI框架替换成真正的loading提示
+  console.log(message);
+  return {
+    // 返回一个对象，可以包含关闭方法等
+    close: () => console.log('加载完成')
+  };
 }
 
 // 获取用户列表数据
@@ -110,7 +120,7 @@ async function viewCertificate(userId) {
     showCertModal.value = true
     selectedCert.value = null
     
-    const response = await fetch(`${apiUrl}/api/users/${userId}/certificate`)
+    const response = await fetch(`${apiUrl}/api/users/certificate?userId=${encodeURIComponent(userId)}`)
     
     if (!response.ok) {
       throw new Error(`获取证书失败: ${response.status}`)
@@ -127,7 +137,41 @@ async function viewCertificate(userId) {
 
 // 撤销证书（暂未实现功能）
 function revokeCertificate(userId) {
-  console.log('撤销证书功能待实现:', userId)
+  const confirmRevoke = confirm(`确定要撤销用户 ${userId} 的证书吗？此操作不可撤销。`);
+  if (!confirmRevoke) return;
+  
+  const loadingToast = showLoadingToast('正在撤销证书...');
+  
+  fetch(`${apiUrl}/api/revoke-certificate`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({ userId })
+  })
+  .then(response => {
+    if (!response.ok) {
+      throw new Error(`撤销证书失败: ${response.status}`);
+    }
+    return response.json();
+  })
+  .then(data => {
+    if (data.success) {
+      alert('证书撤销成功');
+      // 刷新用户列表
+      fetchUserList();
+    } else {
+      alert(`撤销失败: ${data.message || '未知错误'}`);
+    }
+  })
+  .catch(err => {
+    console.error('撤销证书错误:', err);
+    alert(`撤销证书失败: ${err.message}`);
+  })
+  .finally(() => {
+    // 如果有loading提示，可以在这里关闭
+    // 暂时简单alert实现
+  });
 }
 
 // 关闭证书弹窗

@@ -32,6 +32,8 @@
 #define WEB_CMD_LOCAL_GEN_CERT 0x89    // ca_web请求本地生成证书
 #define WEB_CMD_LOCAL_UPD_CERT 0x8A    // ca_web请求本地更新证书
 #define WEB_CMD_LOCAL_RESULT   0x8B    // ca向ca_web发送本地操作结果
+#define WEB_CMD_REVOKE_CERT    0x8C    // ca_web请求撤销证书
+#define WEB_CMD_REVOKE_RESULT  0x8D    // ca向ca_web发送撤销结果
 
 // 用户数据结构
 #define SUBJECT_ID_SIZE 9   // 8字符ID + 结束符
@@ -80,6 +82,7 @@ int request_crl_list();
 int request_cleanup_expired_certs();
 int request_local_gen_cert(const char *user_id);
 int request_local_upd_cert(const char *user_id);
+int request_revoke_cert(const char *user_id);
 
 // HTTP处理函数
 int handle_cors_preflight(struct MHD_Connection *connection);
@@ -88,10 +91,10 @@ int handle_crl_list(struct MHD_Connection *connection);
 int handle_user_certificate(struct MHD_Connection *connection, const char *url);
 int handle_cleanup_expired_certs(struct MHD_Connection *connection);
 int handle_local_cert_operation(struct MHD_Connection *connection, const char *url, const char *upload_data, size_t *upload_data_size, int is_generate);
-// 新增消息签名相关处理函数
 int handle_keypair_with_param(struct MHD_Connection *connection);
 int handle_sign_message(struct MHD_Connection *connection, const char *upload_data, size_t *upload_data_size);
 int handle_verify_signature(struct MHD_Connection *connection, const char *upload_data, size_t *upload_data_size);
+int handle_revoke_certificate(struct MHD_Connection *connection, const char *upload_data, size_t *upload_data_size);
 // 工具函数
 int hex_decode(const char *hex_str, unsigned char *bin_data, int max_size);
 char* hex_encode(const unsigned char *bin_data, int bin_size);
@@ -724,6 +727,53 @@ int request_local_upd_cert(const char *user_id) {
     return result;
 }
 
+// 请求撤销证书
+int request_revoke_cert(const char *user_id) {
+    int result = 0;
+    unsigned char buffer[BUFFER_SIZE];
+    uint8_t cmd;
+    int data_len;
+    
+    // 锁定CA连接
+    pthread_mutex_lock(&ca_socket_mutex);
+    
+    // 检查是否需要重新连接CA
+    if (ca_socket < 0) {
+        ca_socket = connect_to_ca();
+        if (ca_socket < 0) {
+            pthread_mutex_unlock(&ca_socket_mutex);
+            return 0;
+        }
+    }
+    
+    // 发送撤销请求
+    if (!send_message(ca_socket, WEB_CMD_REVOKE_CERT, user_id, strlen(user_id) + 1)) {
+        close(ca_socket);
+        ca_socket = -1;
+        pthread_mutex_unlock(&ca_socket_mutex);
+        return 0;
+    }
+    
+    // 接收响应
+    data_len = recv_message(ca_socket, &cmd, buffer, BUFFER_SIZE);
+    
+    if (data_len < 0 || cmd != WEB_CMD_REVOKE_RESULT) {
+        close(ca_socket);
+        ca_socket = -1;
+        pthread_mutex_unlock(&ca_socket_mutex);
+        return 0;
+    }
+    
+    // 处理响应结果
+    if (data_len > 0) {
+        // 结果为1字节，1表示成功，0表示失败
+        result = buffer[0];
+    }
+    
+    pthread_mutex_unlock(&ca_socket_mutex);
+    return result;
+}
+
 // ---- HTTP处理函数 ----
 
 // 处理CORS预检请求
@@ -820,29 +870,14 @@ int handle_crl_list(struct MHD_Connection *connection) {
 
 // 处理获取单个用户证书请求
 int handle_user_certificate(struct MHD_Connection *connection, const char *url) {
-    // 提取用户ID
-    char user_id[SUBJECT_ID_SIZE] = {0};
-    int matched = 0;
-    
-    // URL格式为 /api/users/{user_id}/certificate
-    const char *id_start = url + 11; // 跳过 "/api/users/"
-    const char *id_end = strstr(id_start, "/");
-    
-    if (id_end && (id_end - id_start) < SUBJECT_ID_SIZE) {
-        size_t id_len = id_end - id_start;
-        memcpy(user_id, id_start, id_len);
-        user_id[id_len] = '\0';
-        matched = 1;
-    }
-    
-    if (!matched || strlen(user_id) != 8) {
+    // 获取userId参数
+    const char *user_id = MHD_lookup_connection_value(connection, MHD_GET_ARGUMENT_KIND, "userId");
+    if (!user_id || strlen(user_id) != 8) {
         return send_json_error(connection, MHD_HTTP_BAD_REQUEST, "无效的用户ID");
     }
-    
     // 请求证书数据，格式：证书结构体 + 哈希值(32字节) + 有效性标志(1字节) + 撤销标志(1字节)
     unsigned char cert_data[BUFFER_SIZE];
     int data_len = request_user_certificate(user_id, cert_data, BUFFER_SIZE);
-    
     if (data_len <= 0) {
         return send_json_error(connection, MHD_HTTP_NOT_FOUND, "无法获取用户证书");
     }
@@ -868,29 +903,19 @@ int handle_user_certificate(struct MHD_Connection *connection, const char *url) 
     
     // 转换证书数据为JSON
     struct json_object *response_obj = json_object_new_object();
-    
-    // 基本字段
     json_object_object_add(response_obj, "serialNum", json_object_new_string((const char*)cert.SerialNum));
     json_object_object_add(response_obj, "issuerID", json_object_new_string((const char*)cert.IssuerID));
     json_object_object_add(response_obj, "subjectID", json_object_new_string((const char*)cert.SubjectID));
-    
-    // 时间戳
     json_object_object_add(response_obj, "validFrom", json_object_new_int64((int64_t)start_time));
     json_object_object_add(response_obj, "validTo", json_object_new_int64((int64_t)end_time));
-    
     // 公钥（转为十六进制字符串）
-    char pubkey_hex[33 * 2 + 1] = {0};
-    for (int i = 0; i < 33; i++) {
-        sprintf(pubkey_hex + i * 2, "%02x", cert.PubKey[i]);
-    }
+    char *pubkey_hex = hex_encode(cert.PubKey, 33);
     json_object_object_add(response_obj, "pubKey", json_object_new_string(pubkey_hex));
-    
+    free(pubkey_hex);
     // 证书哈希（转为十六进制字符串）
-    char hash_hex[32 * 2 + 1] = {0};
-    for (int i = 0; i < 32; i++) {
-        sprintf(hash_hex + i * 2, "%02x", cert_hash[i]);
-    }
+    char *hash_hex = hex_encode(cert_hash, 32);
     json_object_object_add(response_obj, "certHash", json_object_new_string(hash_hex));
+    free(hash_hex);
     
     // 状态标志
     json_object_object_add(response_obj, "isValid", json_object_new_boolean(is_valid));
@@ -1024,13 +1049,10 @@ int handle_local_cert_operation(struct MHD_Connection *connection, const char *u
     return ret;
 }
 
-// 新增消息签名相关处理函数
-
 // 处理通过GET参数获取用户公私钥对的请求
 int handle_keypair_with_param(struct MHD_Connection *connection) {
     // 获取userId查询参数
     const char *user_id = MHD_lookup_connection_value(connection, MHD_GET_ARGUMENT_KIND, "userId");
-    printf("获取到的用户ID: %s\n", user_id);
     if (!user_id || strlen(user_id) != 8) {
         return send_json_error(connection, MHD_HTTP_BAD_REQUEST, "无效的用户ID");
     }
@@ -1272,6 +1294,71 @@ int handle_verify_signature(struct MHD_Connection *connection, const char *uploa
     return ret;
 }
 
+// 处理撤销证书请求
+int handle_revoke_certificate(struct MHD_Connection *connection, const char *upload_data, size_t *upload_data_size) {
+    static char *request_buffer = NULL;
+    struct json_object *request_obj = NULL;
+    
+    // 解析POST数据
+    request_obj = parse_post_data(connection, &request_buffer, upload_data, upload_data_size);
+    
+    // 如果是第一次调用或者没有POST数据，直接返回
+    if (request_obj == NULL && request_buffer != NULL) {
+        return MHD_YES;
+    }
+    
+    // 没有POST数据
+    if (request_obj == NULL) {
+        return send_json_error(connection, MHD_HTTP_BAD_REQUEST, "缺少必要的请求数据");
+    }
+    
+    // 获取请求参数
+    struct json_object *user_id_obj;
+    if (!json_object_object_get_ex(request_obj, "userId", &user_id_obj) ||
+        !json_object_is_type(user_id_obj, json_type_string)) {
+        
+        json_object_put(request_obj);
+        free(request_buffer);
+        request_buffer = NULL;
+        return send_json_error(connection, MHD_HTTP_BAD_REQUEST, "缺少必要的用户ID字段");
+    }
+    
+    const char *user_id = json_object_get_string(user_id_obj);
+    
+    // 检查用户ID格式
+    if (strlen(user_id) != 8) {
+        json_object_put(request_obj);
+        free(request_buffer);
+        request_buffer = NULL;
+        return send_json_error(connection, MHD_HTTP_BAD_REQUEST, "用户ID必须是8个字符");
+    }
+    
+    // 请求撤销证书
+    int result = request_revoke_cert(user_id);
+    
+    // 构建响应
+    struct json_object *response_obj = json_object_new_object();
+    json_object_object_add(response_obj, "success", json_object_new_boolean(result));
+    
+    if (result) {
+        json_object_object_add(response_obj, "message", json_object_new_string("证书撤销成功"));
+    } else {
+        json_object_object_add(response_obj, "message", json_object_new_string("证书撤销失败"));
+    }
+    
+    // 发送响应
+    int ret = send_json_response(connection, MHD_HTTP_OK, response_obj, "POST, OPTIONS");
+    
+    // 清理资源
+    json_object_put(response_obj);
+    json_object_put(request_obj);
+    
+    free(request_buffer);
+    request_buffer = NULL;
+    
+    return ret;
+}
+
 // HTTP请求处理回调函数
 enum MHD_Result request_handler(void *cls, struct MHD_Connection *connection,
                                 const char *url, const char *method,
@@ -1291,12 +1378,9 @@ enum MHD_Result request_handler(void *cls, struct MHD_Connection *connection,
         } else if (strcmp(url, "/api/crl") == 0) {
             return handle_crl_list(connection);
         } else if (strcmp(url, "/api/keypair") == 0) {
-            // 使用GET参数处理密钥对请求
             return handle_keypair_with_param(connection);
-        } else if (strncmp(url, "/api/users/", 11) == 0) {
-            if (strstr(url, "/certificate")) {
-                return handle_user_certificate(connection, url);
-            }
+        } else if (strcmp(url, "/api/users/certificate") == 0) {
+            return handle_user_certificate(connection, url);
         }
     }
     
@@ -1318,6 +1402,8 @@ enum MHD_Result request_handler(void *cls, struct MHD_Connection *connection,
             return handle_sign_message(connection, upload_data, upload_data_size);
         } else if (strcmp(url, "/api/verify-signature") == 0) {
             return handle_verify_signature(connection, upload_data, upload_data_size);
+        } else if (strcmp(url, "/api/revoke-certificate") == 0) {
+            return handle_revoke_certificate(connection, upload_data, upload_data_size);
         }
     }
     

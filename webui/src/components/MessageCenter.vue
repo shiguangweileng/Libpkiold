@@ -258,7 +258,6 @@ async function verifySignature() {
               v-model="receivedMessage" 
               placeholder="这里将显示接收到的消息"
               rows="5"
-              readonly
             ></textarea>
           </div>
           
@@ -269,7 +268,6 @@ async function verifySignature() {
               v-model="messageSignature" 
               placeholder="这里将显示消息的签名"
               rows="3"
-              readonly
             ></textarea>
           </div>
           

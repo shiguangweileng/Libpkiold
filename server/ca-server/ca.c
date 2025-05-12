@@ -34,6 +34,8 @@
 #define WEB_CMD_LOCAL_GEN_CERT 0x89    // ca_web请求本地生成证书
 #define WEB_CMD_LOCAL_UPD_CERT 0x8A    // ca_web请求本地更新证书
 #define WEB_CMD_LOCAL_RESULT   0x8B    // ca向ca_web发送本地操作结果
+#define WEB_CMD_REVOKE_CERT    0x8C    // ca_web请求撤销证书
+#define WEB_CMD_REVOKE_RESULT  0x8D    // ca向ca_web发送撤销结果
 
 unsigned char d_ca[SM2_PRI_MAX_SIZE];
 unsigned char Q_ca[SM2_PUB_MAX_SIZE];
@@ -74,6 +76,7 @@ void handle_web_get_crl(int client_socket);
 void handle_web_cleanup_certs(int client_socket);
 void handle_web_local_gen_cert(int client_socket, const unsigned char *buffer, int data_len);
 void handle_web_local_upd_cert(int client_socket, const unsigned char *buffer, int data_len);
+void handle_web_revoke_cert(int client_socket, const unsigned char *buffer, int data_len);
 
 // 用户数据管理
 int check_user_exists(const char *subject_id);
@@ -1558,6 +1561,10 @@ void handle_web_client(int client_socket) {
                 handle_web_local_upd_cert(client_socket, buffer, data_len);
                 break;
                 
+            case WEB_CMD_REVOKE_CERT:
+                handle_web_revoke_cert(client_socket, buffer, data_len);
+                break;
+                
             default:
                 printf("收到未知Web命令: 0x%02X\n", cmd);
                 break;
@@ -1884,5 +1891,68 @@ void handle_web_local_upd_cert(int client_socket, const unsigned char *buffer, i
     // 发送结果
     unsigned char response = result ? 1 : 0; // 1表示成功，0表示失败
     send_message(client_socket, WEB_CMD_LOCAL_RESULT, &response, 1);
+}
+
+void handle_web_revoke_cert(int client_socket, const unsigned char *buffer, int data_len) {
+    unsigned char response = 0; // 默认为失败
+    char subject_id[SUBJECT_ID_SIZE] = {0};
+    char cert_filename[SUBJECT_ID_SIZE + 15] = {0};
+    unsigned char *cert_hash = NULL;
+    ImpCert cert;
+    
+    if (data_len < SUBJECT_ID_SIZE) {
+        printf("接收到的数据长度错误，无法识别用户ID\n");
+        goto fail;
+    }
+    
+    memcpy(subject_id, buffer, SUBJECT_ID_SIZE - 1);
+    printf("收到web请求，撤销用户 '%s' 的证书\n", subject_id);
+    
+    if (!check_user_exists(subject_id)) {
+        printf("用户ID '%s' 不存在，无法撤销\n", subject_id);
+        goto fail;
+    }
+    
+    sprintf(cert_filename, "%s/%s.crt", USERCERTS_DIR, subject_id);
+    cert_hash = hashmap_get(user_map, subject_id);
+    
+    if (!cert_hash) {
+        printf("无法从用户列表中获取证书哈希\n");
+        goto fail;
+    }
+    
+    if (!load_cert(&cert, cert_filename)) {
+        printf("无法加载用户证书: %s\n", cert_filename);
+        goto fail;
+    }
+    
+    time_t expire_time;
+    memcpy(&expire_time, cert.Validity + sizeof(time_t), sizeof(time_t));
+    
+    if (!add_cert_to_crl(cert_hash, expire_time)) {
+        printf("警告：无法将证书添加到撤销列表\n");
+    }
+    
+    if (!add_cert_to_crlmanager(cert_hash)) {
+        printf("警告：无法将证书添加到CRL管理器\n");
+    }
+    
+    if (!delete_user_from_list(subject_id)) {
+        printf("警告：更新用户列表文件失败，但用户已从内存中移除\n");
+    }
+    
+    if (remove(cert_filename) == 0) {
+        printf("已删除用户证书文件: %s\n", cert_filename);
+    } else {
+        printf("警告：无法删除用户证书文件: %s\n", cert_filename);
+    }
+    
+    printf("用户 '%s' 的证书已成功撤销\n", subject_id);
+    printf("--------------------------------\n");
+    
+    response = 1;
+
+fail:
+    send_message(client_socket, WEB_CMD_REVOKE_RESULT, &response, 1);
 }
 
