@@ -88,64 +88,17 @@ int delete_user_from_list(const char *subject_id);
 int check_cert_in_crl(const unsigned char *cert_hash);
 int add_cert_to_crl(const unsigned char *cert_hash, time_t expire_time);
 int add_cert_to_crlmanager(const unsigned char *cert_hash);
+int cleanup_expired_certificates();
 
 // 序列号管理
 int load_serial_num();
 int save_serial_num();
 char* generate_serial_num();
 
-// 运行模式
-void run_local_mode();
+// 运行和调试
 void run_online_mode();
-
-// 调试功能
 void debug_remove_cert();
-
-// 清理过期证书函数实现
-int cleanup_expired_certificates() {
-    time_t current_time = time(NULL);
-    int cleaned_count = 0;
-    int i;
-    pthread_mutex_lock(&user_map_mutex);  // 复用user_map_mutex锁
-    
-    // 遍历CRL管理器中的节点并清理过期的证书
-    for (i = 0; i < crl_manager->base_v; i++) {
-        if (crl_manager->nodes[i].is_valid && crl_manager->nodes[i].hash) {
-            time_t *expire_time = (time_t *)hashmap_get(crl_map, crl_manager->nodes[i].hash);
-            if (expire_time && *expire_time < current_time) {
-                hashmap_remove(crl_map, crl_manager->nodes[i].hash);
-                CRLManager_remove_node(crl_manager, i);
-                cleaned_count++;
-            }
-        }
-    }
-    // 解锁CRL相关结构
-    pthread_mutex_unlock(&user_map_mutex);
-    
-    // 保存更改
-    if (!crl_hashmap_save(crl_map, CRL_FILE)) {
-        printf("保存CRL列表失败！\n");
-    }
-    
-    if (!CRLManager_save_to_file(crl_manager, CRL_MANAGER_FILE)) {
-        printf("保存CRL管理器失败！\n");
-    }
-    
-    return cleaned_count;
-}
-
-int ensure_directory_exists(const char *dir_path) {
-    struct stat st = {0};
-    if (stat(dir_path, &st) == -1) {
-        // 目录不存在，创建它，设置权限为755
-        if (mkdir(dir_path, 0755) == -1) {
-            printf("无法创建目录: %s\n", dir_path);
-            return 0;
-        }
-        printf("已创建目录: %s\n", dir_path);
-    }
-    return 1;
-}
+int ensure_directory_exists(const char *dir_path);
 
 int main() {
     if(!CA_init(Q_ca, d_ca)){
@@ -160,35 +113,19 @@ int main() {
     }
     
     current_serial_num = load_serial_num();
-    
     user_map = ul_hashmap_load(USERLIST_FILE);
-    if (!user_map) {
-        printf("无法初始化用户哈希表！\n");
+    crl_map = crl_hashmap_load(CRL_FILE);
+    crl_manager = CRLManager_load_from_file(CRL_MANAGER_FILE);
+    
+    if(user_map == NULL || crl_map == NULL || crl_manager == NULL){
+        printf("初始化失败！\n");
         sm2_params_cleanup();
+        hashmap_destroy(user_map);
+        hashmap_destroy(crl_map);
+        CRLManager_free(crl_manager);
         return -1;
     }
 
-    crl_map = crl_hashmap_load(CRL_FILE);
-    if (!crl_map) {
-        printf("无法初始化CRL哈希表！\n");
-        hashmap_destroy(user_map);
-        sm2_params_cleanup();
-        return -1;
-    }
-    
-    crl_manager = CRLManager_load_from_file(CRL_MANAGER_FILE);
-    if (!crl_manager) {
-        crl_manager = CRLManager_init(512, 512);
-        if (!crl_manager) {
-            printf("无法创建CRL管理器！\n");
-            hashmap_destroy(crl_map);
-            hashmap_destroy(user_map);
-            sm2_params_cleanup();
-            return -1;
-        }
-    }
-    
-    // 直接进入线上模式
     run_online_mode();
     
     hashmap_destroy(user_map);
@@ -201,8 +138,6 @@ int main() {
     
     return 0;
 }
-
-// ============ 函数实现部分，按功能分组 ============
 
 // ---- 网络通信相关函数 ----
 
@@ -539,7 +474,7 @@ cleanup:
 }
 
 void handle_message(int client_socket, const unsigned char *buffer, int data_len) {
-    if (data_len < 2) {  // 至少需要2字节的消息长度字段
+    if (data_len < 2) {
         printf("接收到的数据长度错误\n");
         return;
     }
@@ -621,7 +556,6 @@ void handle_online_csp(int client_socket, const unsigned char *buffer, int data_
     // 从请求中获取证书哈希
     unsigned char cert_hash[CERT_HASH_SIZE];
     memcpy(cert_hash, buffer, CERT_HASH_SIZE);
-    
     
     // 检查证书是否在撤销列表中
     int cert_status = !check_cert_in_crl(cert_hash); // 1=有效，0=已撤销
@@ -915,7 +849,6 @@ int local_generate_cert(const char *subject_id) {
     Ku = BN_new();
     BN_rand_range(Ku, order);
 
-    // 计算临时公钥Ru=Ku*G
     Ru = EC_POINT_new(group);
     if (!EC_POINT_mul(group, Ru, Ku, NULL, NULL, NULL)) {
         printf("计算临时公钥Ru失败\n");
@@ -923,11 +856,9 @@ int local_generate_cert(const char *subject_id) {
     }
     
     // --------step2:CA端生成隐式证书计算部分重构值-----------
-    // CA选取随机值k
     k = BN_new();
     BN_rand_range(k, order);
 
-    // 计算公钥重构值Pu=Ru+k*G
     Pu = EC_POINT_new(group);
     if (!EC_POINT_mul(group, Pu, k, NULL, NULL, NULL) ||
         !EC_POINT_add(group, Pu, Ru, Pu, NULL)) {
@@ -935,7 +866,6 @@ int local_generate_cert(const char *subject_id) {
         goto cleanup;
     }
 
-    // 生成新的证书
     serial_num = generate_serial_num();
     printf("生成新证书，序列号: %s\n", serial_num);
     ImpCert cert;
@@ -952,33 +882,28 @@ int local_generate_cert(const char *subject_id) {
         goto cleanup;
     }
     
-    // 保存证书到UserCerts目录下
     char cert_filename[100] = {0};
     sprintf(cert_filename, "%s/%s.crt", USERCERTS_DIR, subject_id);
     if (!save_cert(&cert, cert_filename)) {
         printf("警告：无法保存用户证书到文件\n");
     }
     
-    // 计算隐式证书的哈希值
     unsigned char cert_hash[32];
     sm3_hash((const unsigned char *)&cert, sizeof(ImpCert), cert_hash);
     print_hex("隐式证书哈希值e", cert_hash, 32);
 
-    // 保存用户信息到UserList
     if (!save_user_list(subject_id, cert_hash)) {
         printf("保存用户数据失败！\n");
         goto cleanup;
     }
-    // 计算部分私钥r=e×k+d_ca (mod n)
+    
     unsigned char r[SM2_PRI_MAX_SIZE];
     calculate_r(r, cert_hash, k, d_ca, order);
     
     //--------step3:用户端生成最终的公私钥对(现在由CA模拟)-------------
-    // 计算最终私钥d_u=e×Ku+r (mod n)
     unsigned char d_u[SM2_PRI_MAX_SIZE];
     calculate_r(d_u, cert_hash, Ku, r, order);
     
-    // 公钥重构 Qu=e×Pu+Q_ca
     unsigned char Qu[SM2_PUB_MAX_SIZE];
     rec_pubkey(Qu, cert_hash, Pu, Q_ca);
 
@@ -987,7 +912,6 @@ int local_generate_cert(const char *subject_id) {
         goto cleanup;
     }
 
-    // 保存用户私钥
     char priv_key_filename[100] = {0};
     sprintf(priv_key_filename, "%s/%s_priv.key", USERDATA_DIR, subject_id);
     FILE *key_file = fopen(priv_key_filename, "wb");
@@ -998,10 +922,8 @@ int local_generate_cert(const char *subject_id) {
         printf("警告：无法保存用户私钥到文件\n");
     }
     
-    // 保存用户公钥
     char pub_key_filename[100] = {0};
     sprintf(pub_key_filename, "%s/%s_pub.key", USERDATA_DIR, subject_id);
-    
     FILE *pub_key_file = fopen(pub_key_filename, "wb");
     if (pub_key_file) {
         fwrite(Qu, 1, SM2_PUB_MAX_SIZE, pub_key_file);
@@ -1014,7 +936,6 @@ int local_generate_cert(const char *subject_id) {
     ret = 1;
     
 cleanup:
-    // 释放资源
     if (Ru) EC_POINT_free(Ru);
     if (Pu) EC_POINT_free(Pu);
     if (k) BN_free(k);
@@ -1035,7 +956,6 @@ int local_update_cert(const char *subject_id) {
         return 0;
     }
     
-    // 加载用户的现有证书
     char cert_filename[100] = {0};
     sprintf(cert_filename, "%s/%s.crt", USERCERTS_DIR, subject_id);
     
@@ -1045,31 +965,26 @@ int local_update_cert(const char *subject_id) {
         return 0;
     }
     
-    // 验证证书有效性
     if (!validate_cert(&old_cert)) {
         printf("用户证书已过期，请重新注册\n");
         return 0;
     }
     
-    // 直接从用户哈希表获取证书哈希
     unsigned char *old_cert_hash = hashmap_get(user_map, subject_id);
     if (!old_cert_hash) {
         printf("无法从用户列表中获取证书哈希\n");
         return 0;
     }
     
-    // 检查证书是否在撤销列表中
     if (check_cert_in_crl(old_cert_hash)) {
         printf("用户证书已被撤销，请重新注册\n");
         return 0;
     }
     
     //--------step1:用户端(现在由CA模拟)-----------
-    // 设置秘密值Ku
     Ku = BN_new();
     BN_rand_range(Ku, order);
 
-    // 计算临时公钥Ru=Ku*G
     Ru = EC_POINT_new(group);
     if (!EC_POINT_mul(group, Ru, Ku, NULL, NULL, NULL)) {
         printf("计算临时公钥Ru失败\n");
@@ -1077,11 +992,9 @@ int local_update_cert(const char *subject_id) {
     }
     
     // --------步骤与证书注册类似:CA端生成新隐式证书-----------
-    // CA选取随机值k
     k = BN_new();
     BN_rand_range(k, order);
 
-    // 计算公钥重构值Pu=Ru+k*G
     new_Pu = EC_POINT_new(group);
     if (!EC_POINT_mul(group, new_Pu, k, NULL, NULL, NULL) ||
         !EC_POINT_add(group, new_Pu, Ru, new_Pu, NULL)) {
@@ -1089,7 +1002,6 @@ int local_update_cert(const char *subject_id) {
         goto cleanup;
     }
 
-    // 生成新的证书
     char* serial_num = generate_serial_num();
     printf("生成更新证书，序列号: %s\n", serial_num);
     ImpCert new_cert;
@@ -1106,51 +1018,41 @@ int local_update_cert(const char *subject_id) {
         goto cleanup;
     }
 
-    // 计算新隐式证书的哈希值
     unsigned char new_cert_hash[32];
     sm3_hash((const unsigned char *)&new_cert, sizeof(ImpCert), new_cert_hash);
     print_hex("新隐式证书哈希值e", new_cert_hash, 32);
 
-    // 获取旧证书的到期时间
     time_t old_expire_time;
     memcpy(&old_expire_time, old_cert.Validity + sizeof(time_t), sizeof(time_t));
 
-    // 将旧证书加入撤销列表
     if (!add_cert_to_crl(old_cert_hash, old_expire_time)) {
         printf("警告：无法将旧证书添加到撤销列表\n");
     }
     
-    // 将旧证书加入CRL管理器
     if (!add_cert_to_crlmanager(old_cert_hash)) {
         printf("警告：无法将旧证书添加到CRL管理器\n");
     }
     
-    // 更新用户信息到UserList.txt
     if (!update_user_list(subject_id, new_cert_hash)) {
         printf("更新用户数据失败！\n");
     }
 
-    // 保存新证书到文件系统，覆盖现有文件
     if (save_cert(&new_cert, cert_filename)) {
         printf("新用户证书已保存为 %s\n", cert_filename);
     } else {
         printf("警告：无法保存新用户证书到文件\n");
     }
 
-    // 计算部分私钥r=e×k+d_ca (mod n)
     unsigned char r[SM2_PRI_MAX_SIZE];
     calculate_r(r, new_cert_hash, k, d_ca, order);
     
     //--------step3:用户端生成最终的公私钥对(现在由CA模拟)-------------
-    // 计算最终私钥d_u=e×Ku+r (mod n)
     unsigned char d_u[SM2_PRI_MAX_SIZE];
     calculate_r(d_u, new_cert_hash, Ku, r, order);
     
-    // 公钥重构 Qu=e×Pu+Q_ca
     unsigned char Qu[SM2_PUB_MAX_SIZE];
     rec_pubkey(Qu, new_cert_hash, new_Pu, Q_ca);
     
-    // 验证密钥对
     if(!verify_key_pair_bytes(group, Qu, d_u)){
         printf("新密钥对验证失败！\n");
         goto cleanup;
@@ -1158,10 +1060,8 @@ int local_update_cert(const char *subject_id) {
     
     printf("新密钥对验证成功！\n");
     
-    // 保存用户新私钥供后续使用
     char priv_key_filename[100] = {0};
     sprintf(priv_key_filename, "%s/%s_priv.key", USERDATA_DIR, subject_id);
-    
     FILE *key_file = fopen(priv_key_filename, "wb");
     if (key_file) {
         fwrite(d_u, 1, SM2_PRI_MAX_SIZE, key_file);
@@ -1170,10 +1070,8 @@ int local_update_cert(const char *subject_id) {
         printf("警告：无法保存更新后的用户私钥到文件\n");
     }
     
-    // 保存用户新公钥供后续使用
     char pub_key_filename[100] = {0};
     sprintf(pub_key_filename, "%s/%s_pub.key", USERDATA_DIR, subject_id);
-    
     FILE *pub_key_file = fopen(pub_key_filename, "wb");
     if (pub_key_file) {
         fwrite(Qu, 1, SM2_PUB_MAX_SIZE, pub_key_file);
@@ -1190,7 +1088,6 @@ cleanup:
     if (new_Pu) EC_POINT_free(new_Pu);
     if (k) BN_free(k);
     if (Ku) BN_free(Ku);
-    
     return ret;
 }
 
@@ -1208,13 +1105,11 @@ int update_user_list(const char *subject_id, const unsigned char *new_cert_hash)
 }
 
 int delete_user_from_list(const char *subject_id) {
-    // 从哈希表中删除用户
     if (!hashmap_remove(user_map, subject_id)) {
         printf("用户 '%s' 不存在于哈希表中\n", subject_id);
         return 0;  // 删除失败
     }
     
-    // 更新用户列表文件
     return ul_hashmap_save(user_map, USERLIST_FILE);
 }
 
@@ -1229,7 +1124,6 @@ int add_cert_to_crl(const unsigned char *cert_hash, time_t expire_time) {
     
     memcpy(cert_hash_copy, cert_hash, CERT_HASH_SIZE);
     
-    // 分配存储到期时间的内存
     time_t* expire_time_copy = malloc(sizeof(time_t));
     if (!expire_time_copy) {
         free(cert_hash_copy);
@@ -1288,82 +1182,6 @@ char* generate_serial_num() {
     save_serial_num();
     
     return serial_str;
-}
-
-// ---- 运行模式相关函数 ----
-void run_local_mode() {
-    int choice = 0;
-    char subject_id[SUBJECT_ID_SIZE] = {0};
-    int running = 1;
-    
-    printf("===== CA服务器-本地模式 =====\n");
-    
-    while (running) {
-        // 显示菜单
-        printf("\n请选择操作:\n");
-        printf("1. 本地证书注册\n");
-        printf("2. 本地证书更新\n");
-        printf("0. 退出\n");
-        printf("请输入选择: ");
-        
-        if (scanf("%d", &choice) != 1) {
-            printf("输入错误，请重新输入\n");
-            // 清空输入缓冲区
-            clear_input_buffer();
-            continue;
-        }
-        
-        if (choice == 0) {
-            running = 0;
-            printf("正在退出本地模式...\n");
-            continue;
-        }
-        
-        // 清空输入缓冲区
-        clear_input_buffer();
-        
-        // 获取用户ID
-        printf("请输入用户ID (必须是8个字符): ");
-        if (scanf("%8s", subject_id) != 1 || strlen(subject_id) != 8) {
-            printf("ID输入错误，必须是8个字符\n");
-            // 清空输入缓冲区
-            clear_input_buffer();
-            continue;
-        }
-        
-        // 清空输入缓冲区
-        clear_input_buffer();
-        
-        switch (choice) {
-            case 1:
-                printf("--------------------------------\n");
-                local_generate_cert(subject_id);
-                break;
-            case 2:
-                printf("--------------------------------\n");
-                local_update_cert(subject_id);
-                break;
-            default:
-                printf("无效的选择\n");
-                break;
-        }
-        
-        // 保存信息
-        if(!ul_hashmap_save(user_map, USERLIST_FILE)){
-            printf("保存用户列表失败！\n");
-        }
-        if(!crl_hashmap_save(crl_map, CRL_FILE)){
-            printf("保存CRL列表失败！\n");
-        }
-        // 保存序列号
-        if(!save_serial_num()){
-            printf("保存序列号失败！\n");
-        }
-        // 保存CRL管理器
-        if(!CRLManager_save_to_file(crl_manager, CRL_MANAGER_FILE)){
-            printf("保存CRL管理器失败！\n");
-        }
-    }
 }
 
 void run_online_mode() {
@@ -1527,7 +1345,6 @@ void handle_web_client(int client_socket) {
     int data_len;
     
     while(web_server_running) {
-        // 接收命令
         data_len = recv_message(client_socket, &cmd, buffer, BUFFER_SIZE);
         if (data_len < 0) {
             printf("接收ca_web消息失败，连接可能已断开\n");
@@ -1579,7 +1396,6 @@ void handle_web_get_users(int client_socket) {
     int response_len = 0;
     int offset = 0;
     
-    // 锁定用户哈希表，防止在读取过程中被修改
     pthread_mutex_lock(&user_map_mutex);
     
     // 计算用户数量
@@ -1615,10 +1431,9 @@ void handle_web_get_users(int client_socket) {
         }
     }
     
-    // 解锁用户哈希表
     pthread_mutex_unlock(&user_map_mutex);
     
-    // 发送响应
+
     if (!send_message(client_socket, WEB_CMD_USER_LIST, response_data, response_len)) {
         printf("发送用户列表失败\n");
     }
@@ -1628,27 +1443,21 @@ void handle_web_get_users(int client_socket) {
 
 // 处理获取单个用户证书的请求
 void handle_web_get_cert(int client_socket, const unsigned char *buffer, int data_len) {
-    // 验证数据长度
     if (data_len < SUBJECT_ID_SIZE) {
         printf("接收到的数据长度错误，无法识别用户ID\n");
-        // 发送空数据表示错误
         send_message(client_socket, WEB_CMD_CERT_DATA, NULL, 0);
         return;
     }
     
-    // 提取用户ID
     char subject_id[SUBJECT_ID_SIZE] = {0};
     memcpy(subject_id, buffer, SUBJECT_ID_SIZE - 1); // 确保null结尾
     
-    // 检查用户是否存在
     if (!check_user_exists(subject_id)) {
         printf("用户ID '%s' 不存在\n", subject_id);
-        // 发送空数据表示错误
         send_message(client_socket, WEB_CMD_CERT_DATA, NULL, 0);
         return;
     }
     
-    // 加载用户证书
     char cert_filename[SUBJECT_ID_SIZE + 15] = {0};
     sprintf(cert_filename, "%s/%s.crt", USERCERTS_DIR, subject_id);
     
@@ -1664,13 +1473,9 @@ void handle_web_get_cert(int client_socket, const unsigned char *buffer, int dat
     unsigned char cert_hash[32];
     sm3_hash((const unsigned char *)&cert, sizeof(ImpCert), cert_hash);
     
-    // 检查证书是否在撤销列表中
     int cert_revoked = check_cert_in_crl(cert_hash);
-    
-    // 检查证书是否有效
     int cert_valid = validate_cert(&cert) && !cert_revoked;
     
-    // 提取时间戳
     time_t start_time, end_time;
     memcpy(&start_time, cert.Validity, sizeof(time_t));
     memcpy(&end_time, cert.Validity + sizeof(time_t), sizeof(time_t));
@@ -1690,8 +1495,7 @@ void handle_web_get_cert(int client_socket, const unsigned char *buffer, int dat
     
     // 添加撤销标志
     response[sizeof(ImpCert) + 32 + 1] = cert_revoked ? 1 : 0;
-    
-    // 发送响应
+
     if (!send_message(client_socket, WEB_CMD_CERT_DATA, response, sizeof(response))) {
         printf("发送证书数据失败\n");
     }
@@ -1704,7 +1508,6 @@ void handle_web_get_crl(int client_socket) {
     int response_len = 0;
     int offset = 0;
     
-    // 锁定CRL哈希表，防止在读取过程中被修改
     pthread_mutex_lock(&user_map_mutex);  // 复用user_map_mutex锁
     
     // 计算CRL条目数量
@@ -1748,8 +1551,7 @@ void handle_web_get_crl(int client_socket) {
             entry = entry->next;
         }
     }
-    
-    // 解锁CRL哈希表
+
     pthread_mutex_unlock(&user_map_mutex);
     
     // 发送响应
@@ -1850,7 +1652,6 @@ void handle_web_local_gen_cert(int client_socket, const unsigned char *buffer, i
 
 // 处理从ca_web收到的本地证书更新请求
 void handle_web_local_upd_cert(int client_socket, const unsigned char *buffer, int data_len) {
-    // 验证数据长度
     if (data_len < SUBJECT_ID_SIZE) {
         printf("接收到的数据长度错误，无法识别用户ID\n");
         // 发送失败结果
@@ -1859,13 +1660,11 @@ void handle_web_local_upd_cert(int client_socket, const unsigned char *buffer, i
         return;
     }
     
-    // 提取用户ID
     char subject_id[SUBJECT_ID_SIZE] = {0};
     memcpy(subject_id, buffer, SUBJECT_ID_SIZE - 1); // 确保null结尾
     
     printf("收到web请求，为用户 '%s' 本地更新证书\n", subject_id);
     
-    // 锁定用户哈希表
     pthread_mutex_lock(&user_map_mutex);
     
     // 调用本地证书更新函数
@@ -1885,10 +1684,8 @@ void handle_web_local_upd_cert(int client_socket, const unsigned char *buffer, i
         printf("保存CRL管理器失败！\n");
     }
     
-    // 解锁用户哈希表
     pthread_mutex_unlock(&user_map_mutex);
     
-    // 发送结果
     unsigned char response = result ? 1 : 0; // 1表示成功，0表示失败
     send_message(client_socket, WEB_CMD_LOCAL_RESULT, &response, 1);
 }
@@ -1954,5 +1751,46 @@ void handle_web_revoke_cert(int client_socket, const unsigned char *buffer, int 
 
 fail:
     send_message(client_socket, WEB_CMD_REVOKE_RESULT, &response, 1);
+}
+
+// 清理过期证书函数实现
+int cleanup_expired_certificates() {
+    time_t current_time = time(NULL);
+    int cleaned_count = 0;
+    int i;
+    pthread_mutex_lock(&user_map_mutex);  // 复用user_map_mutex锁
+    
+    // 遍历CRL管理器中的节点并清理过期的证书
+    for (i = 0; i < crl_manager->base_v; i++) {
+        if (crl_manager->nodes[i].is_valid && crl_manager->nodes[i].hash) {
+            time_t *expire_time = (time_t *)hashmap_get(crl_map, crl_manager->nodes[i].hash);
+            if (expire_time && *expire_time < current_time) {
+                hashmap_remove(crl_map, crl_manager->nodes[i].hash);
+                CRLManager_remove_node(crl_manager, i);
+                cleaned_count++;
+            }
+        }
+    }
+    pthread_mutex_unlock(&user_map_mutex);
+    if (!crl_hashmap_save(crl_map, CRL_FILE)) {
+        printf("保存CRL列表失败！\n");
+    }
+    if (!CRLManager_save_to_file(crl_manager, CRL_MANAGER_FILE)) {
+        printf("保存CRL管理器失败！\n");
+    }
+    
+    return cleaned_count;
+}
+
+int ensure_directory_exists(const char *dir_path) {
+    struct stat st = {0};
+    if (stat(dir_path, &st) == -1) {
+        if (mkdir(dir_path, 0755) == -1) {
+            printf("无法创建目录: %s\n", dir_path);
+            return 0;
+        }
+        printf("已创建目录: %s\n", dir_path);
+    }
+    return 1;
 }
 

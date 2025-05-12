@@ -303,8 +303,6 @@ int load_keys_and_cert(const char *user_id) {
     }
     fclose(cert_file);
     
-    //print_cert_info(&loaded_cert);
-    
     // 加载私钥
     FILE *priv_file = fopen(priv_key_filename, "rb");
     if (!priv_file) {
@@ -727,15 +725,12 @@ int request_cert_revoke(int sock, const char *user_id) {
         return 0;
     }
     
-    // 解析响应状态
     uint8_t status = response[0];
     
-    // 解析时间戳
     uint64_t resp_timestamp;
     memcpy(&resp_timestamp, response + 1, 8);
     resp_timestamp = be64toh(resp_timestamp);  // 网络字节序转为主机字节序
     
-    // 使用validate_timestamp函数验证时间戳
     if (!validate_timestamp(resp_timestamp)) {
         printf("撤销响应中的时间戳无效\n");
         return 0;
@@ -847,8 +842,6 @@ int load_crl_manager_to_hashmap() {
 // 本地检查证书是否在CRL中
 int check_cert_in_local_crl(const unsigned char *cert_hash) {
     if (!local_crl || !cert_hash) return 0;
-    
-    // 使用哈希表快速检查证书哈希是否存在
     return hashmap_exists(local_crl, cert_hash);
 }
 
@@ -1009,11 +1002,7 @@ int online_csp(int sock, const unsigned char *cert_hash) {
     uint8_t status = buffer[0];
     uint64_t timestamp;
     memcpy(&timestamp, buffer + 1, 8);
-    
-    // 转换为主机字节序
     timestamp = be64toh(timestamp);
-    
-    // 使用validate_timestamp函数验证时间戳
     if (!validate_timestamp(timestamp)) {
         printf("证书状态响应中的时间戳无效，使用本地查询\n");
         goto use_local;
@@ -1027,11 +1016,9 @@ int online_csp(int sock, const unsigned char *cert_hash) {
     uint64_t ts_network = htobe64(timestamp);
     memcpy(signed_data + CERT_HASH_SIZE + 1, &ts_network, 8);
     
-    // 提取签名
     unsigned char signature[64];
     memcpy(signature, buffer + 1 + 8, 64);
     
-    // 用CA公钥验证签名
     if (!sm2_verify(signature, signed_data, CERT_HASH_SIZE + 1 + 8, Q_ca)) {
         printf("CA签名验证失败！此响应可能不是来自合法CA，使用本地查询\n");
         goto use_local;
@@ -1039,7 +1026,6 @@ int online_csp(int sock, const unsigned char *cert_hash) {
     return status;
     
 use_local:
-    // 使用本地CRL查询证书状态
     local_status = local_csp(cert_hash);
     return local_status;
 }

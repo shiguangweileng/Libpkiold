@@ -186,7 +186,6 @@ int main() {
     }
     pthread_mutex_unlock(&crl_mutex);
     
-    // 清理SM2参数
     sm2_params_cleanup();
     
     return 0;
@@ -404,16 +403,13 @@ int request_user_list() {
         
         // 检查数据大小是否合理
         if (data_len == sizeof(int) + new_user_count * (SUBJECT_ID_SIZE + CERT_HASH_SIZE)) {
-            // 锁定用户数据
             pthread_mutex_lock(&users_mutex);
-            
             // 释放旧数据
             if (users) {
                 free(users);
                 users = NULL;
                 user_count = 0;
             }
-            
             // 分配新内存
             if (new_user_count > 0) {
                 users = (UserInfo*)malloc(sizeof(UserInfo) * new_user_count);
@@ -431,15 +427,12 @@ int request_user_list() {
                         memcpy(users[i].cert_hash, buffer + offset, CERT_HASH_SIZE);
                         offset += CERT_HASH_SIZE;
                     }
-                    
                     result = 1;
                 }
             } else {
                 // 空列表
                 result = 1;
             }
-            
-            // 解锁用户数据
             pthread_mutex_unlock(&users_mutex);
         }
     }
@@ -456,8 +449,7 @@ int request_crl_list() {
     unsigned char buffer[BUFFER_SIZE];
     int data_len;
     uint8_t cmd;
-    
-    // 锁定CA连接
+
     pthread_mutex_lock(&ca_socket_mutex);
     
     // 检查连接是否有效
@@ -466,13 +458,11 @@ int request_crl_list() {
         return 0;
     }
     
-    // 发送请求
     if (!send_message(ca_socket, WEB_CMD_GET_CRL, NULL, 0)) {
         pthread_mutex_unlock(&ca_socket_mutex);
         return 0;
     }
     
-    // 接收响应
     data_len = recv_message(ca_socket, &cmd, buffer, BUFFER_SIZE);
     
     if (data_len < 0 || cmd != WEB_CMD_CRL_DATA) {
@@ -499,7 +489,6 @@ int request_crl_list() {
         
         // 检查数据大小是否合理
         if (data_len == sizeof(int) * 3 + new_crl_count * (CERT_HASH_SIZE + sizeof(time_t))) {
-            // 锁定CRL数据
             pthread_mutex_lock(&crl_mutex);
             
             // 释放旧数据
@@ -525,22 +514,16 @@ int request_crl_list() {
                         memcpy(&crl_entries[i].expire_time, buffer + offset, sizeof(time_t));
                         offset += sizeof(time_t);
                     }
-                    
                     result = 1;
                 }
             } else {
                 // 空列表
                 result = 1;
             }
-            
-            // 解锁CRL数据
             pthread_mutex_unlock(&crl_mutex);
         }
     }
-    
-    // 解锁CA连接
     pthread_mutex_unlock(&ca_socket_mutex);
-    
     return result;
 }
 
@@ -550,11 +533,8 @@ int request_user_certificate(const char *user_id, unsigned char *cert_data, int 
     int data_len;
     uint8_t cmd;
     int result = 0;
-    
-    // 锁定CA连接
+
     pthread_mutex_lock(&ca_socket_mutex);
-    
-    // 检查连接是否有效
     if (ca_socket < 0) {
         pthread_mutex_unlock(&ca_socket_mutex);
         return 0;
@@ -585,10 +565,8 @@ int request_user_certificate(const char *user_id, unsigned char *cert_data, int 
         memcpy(cert_data, buffer, data_len);
         result = data_len;
     }
-    
-    // 解锁CA连接
+
     pthread_mutex_unlock(&ca_socket_mutex);
-    
     return result;
 }
 
@@ -598,8 +576,7 @@ int request_cleanup_expired_certs() {
     int data_len;
     uint8_t cmd;
     int cleaned_count = 0;
-    
-    // 锁定CA连接
+
     pthread_mutex_lock(&ca_socket_mutex);
     
     // 检查连接是否有效
@@ -608,13 +585,10 @@ int request_cleanup_expired_certs() {
         return -1;
     }
     
-    // 发送清理请求
     if (!send_message(ca_socket, WEB_CMD_CLEANUP_CERTS, NULL, 0)) {
         pthread_mutex_unlock(&ca_socket_mutex);
         return -1;
     }
-    
-    // 接收响应
     data_len = recv_message(ca_socket, &cmd, buffer, BUFFER_SIZE);
     
     if (data_len < 0 || cmd != WEB_CMD_CLEANUP_RESULT) {
@@ -626,8 +600,6 @@ int request_cleanup_expired_certs() {
     if (data_len >= sizeof(int)) {
         memcpy(&cleaned_count, buffer, sizeof(int));
     }
-    
-    // 解锁CA连接
     pthread_mutex_unlock(&ca_socket_mutex);
     
     return cleaned_count;
@@ -640,9 +612,7 @@ int request_local_gen_cert(const char *user_id) {
     uint8_t cmd;
     int data_len;
     
-    // 锁定CA连接
     pthread_mutex_lock(&ca_socket_mutex);
-    
     // 检查是否需要重新连接CA
     if (ca_socket < 0) {
         ca_socket = connect_to_ca();
@@ -651,16 +621,13 @@ int request_local_gen_cert(const char *user_id) {
             return 0;
         }
     }
-    
-    // 发送请求
+
     if (!send_message(ca_socket, WEB_CMD_LOCAL_GEN_CERT, user_id, strlen(user_id) + 1)) {
         close(ca_socket);
         ca_socket = -1;
         pthread_mutex_unlock(&ca_socket_mutex);
         return 0;
     }
-    
-    // 接收响应
     data_len = recv_message(ca_socket, &cmd, buffer, BUFFER_SIZE);
     
     if (data_len < 0 || cmd != WEB_CMD_LOCAL_RESULT) {
@@ -686,11 +653,8 @@ int request_local_upd_cert(const char *user_id) {
     unsigned char buffer[BUFFER_SIZE];
     uint8_t cmd;
     int data_len;
-    
-    // 锁定CA连接
+
     pthread_mutex_lock(&ca_socket_mutex);
-    
-    // 检查是否需要重新连接CA
     if (ca_socket < 0) {
         ca_socket = connect_to_ca();
         if (ca_socket < 0) {
@@ -698,18 +662,15 @@ int request_local_upd_cert(const char *user_id) {
             return 0;
         }
     }
-    
-    // 发送请求
+
     if (!send_message(ca_socket, WEB_CMD_LOCAL_UPD_CERT, user_id, strlen(user_id) + 1)) {
         close(ca_socket);
         ca_socket = -1;
         pthread_mutex_unlock(&ca_socket_mutex);
         return 0;
     }
-    
-    // 接收响应
+
     data_len = recv_message(ca_socket, &cmd, buffer, BUFFER_SIZE);
-    
     if (data_len < 0 || cmd != WEB_CMD_LOCAL_RESULT) {
         close(ca_socket);
         ca_socket = -1;
@@ -733,11 +694,8 @@ int request_revoke_cert(const char *user_id) {
     unsigned char buffer[BUFFER_SIZE];
     uint8_t cmd;
     int data_len;
-    
-    // 锁定CA连接
+
     pthread_mutex_lock(&ca_socket_mutex);
-    
-    // 检查是否需要重新连接CA
     if (ca_socket < 0) {
         ca_socket = connect_to_ca();
         if (ca_socket < 0) {
@@ -745,18 +703,14 @@ int request_revoke_cert(const char *user_id) {
             return 0;
         }
     }
-    
-    // 发送撤销请求
+
     if (!send_message(ca_socket, WEB_CMD_REVOKE_CERT, user_id, strlen(user_id) + 1)) {
         close(ca_socket);
         ca_socket = -1;
         pthread_mutex_unlock(&ca_socket_mutex);
         return 0;
     }
-    
-    // 接收响应
     data_len = recv_message(ca_socket, &cmd, buffer, BUFFER_SIZE);
-    
     if (data_len < 0 || cmd != WEB_CMD_REVOKE_RESULT) {
         close(ca_socket);
         ca_socket = -1;
@@ -791,8 +745,7 @@ int handle_cors_preflight(struct MHD_Connection *connection) {
 // 处理用户列表请求
 int handle_user_list(struct MHD_Connection *connection) {
     struct json_object *response_obj = json_object_new_array();
-    
-    // 锁定用户数据
+
     pthread_mutex_lock(&users_mutex);
     
     // 将实际用户数据转换为JSON
@@ -810,8 +763,6 @@ int handle_user_list(struct MHD_Connection *connection) {
         
         json_object_array_add(response_obj, user);
     }
-    
-    // 解锁用户数据
     pthread_mutex_unlock(&users_mutex);
     
     int ret = send_json_response(connection, MHD_HTTP_OK, response_obj, "GET, OPTIONS");
@@ -852,14 +803,12 @@ int handle_crl_list(struct MHD_Connection *connection) {
         struct tm *tm_info = localtime(&crl_entries[i].expire_time);
         strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", tm_info);
         json_object_object_add(crl_item, "expireTime", json_object_new_string(time_str));
-        
         json_object_array_add(crl_array, crl_item);
     }
     
     // 添加CRL数组到响应对象
     json_object_object_add(response_obj, "crlItems", crl_array);
-    
-    // 解锁CRL数据
+
     pthread_mutex_unlock(&crl_mutex);
     
     int ret = send_json_response(connection, MHD_HTTP_OK, response_obj, "GET, OPTIONS");
@@ -931,8 +880,6 @@ int handle_user_certificate(struct MHD_Connection *connection, const char *url) 
 int handle_cleanup_expired_certs(struct MHD_Connection *connection) {
     // 请求清理过期证书
     int cleaned_count = request_cleanup_expired_certs();
-    
-    // 创建JSON响应
     struct json_object *response_obj = json_object_new_object();
     
     if (cleaned_count >= 0) {
@@ -942,7 +889,6 @@ int handle_cleanup_expired_certs(struct MHD_Connection *connection) {
         json_object_object_add(response_obj, "success", json_object_new_boolean(0));
         json_object_object_add(response_obj, "error", json_object_new_string("无法清理证书，请确保CA服务器运行正常"));
     }
-    
     int ret = send_json_response(connection, MHD_HTTP_OK, response_obj, "POST, OPTIONS");
     json_object_put(response_obj);
     
@@ -1036,10 +982,8 @@ int handle_local_cert_operation(struct MHD_Connection *connection, const char *u
             json_object_new_string(is_generate ? "证书生成失败" : "证书更新失败"));
     }
     
-    // 发送响应
     int ret = send_json_response(connection, MHD_HTTP_OK, response_obj, "POST, OPTIONS");
-    
-    // 清理资源
+
     json_object_put(response_obj);
     json_object_put(request_obj);
     
@@ -1102,8 +1046,7 @@ int handle_keypair_with_param(struct MHD_Connection *connection) {
     json_object_object_add(response_obj, "publicKey", json_object_new_string(pub_hex));
     
     int ret = send_json_response(connection, MHD_HTTP_OK, response_obj, "GET, OPTIONS");
-    
-    // 释放资源
+
     json_object_put(response_obj);
     free(priv_hex);
     free(pub_hex);
@@ -1115,8 +1058,7 @@ int handle_keypair_with_param(struct MHD_Connection *connection) {
 int handle_sign_message(struct MHD_Connection *connection, const char *upload_data, size_t *upload_data_size) {
     static char *request_buffer = NULL;
     struct json_object *request_obj = NULL;
-    
-    // 解析POST数据
+
     request_obj = parse_post_data(connection, &request_buffer, upload_data, upload_data_size);
     
     // 如果是第一次调用或者没有POST数据，直接返回
@@ -1176,8 +1118,7 @@ int handle_sign_message(struct MHD_Connection *connection, const char *upload_da
     }
     
     int ret = send_json_response(connection, MHD_HTTP_OK, response_obj, "POST, OPTIONS");
-    
-    // 释放资源
+
     json_object_put(response_obj);
     json_object_put(request_obj);
     
@@ -1191,16 +1132,14 @@ int handle_sign_message(struct MHD_Connection *connection, const char *upload_da
 int handle_verify_signature(struct MHD_Connection *connection, const char *upload_data, size_t *upload_data_size) {
     static char *request_buffer = NULL;
     struct json_object *request_obj = NULL;
-    
-    // 解析POST数据
+
     request_obj = parse_post_data(connection, &request_buffer, upload_data, upload_data_size);
     
     // 如果是第一次调用或者没有POST数据，直接返回
     if (request_obj == NULL && request_buffer != NULL) {
         return MHD_YES;
     }
-    
-    // 没有POST数据
+
     if (request_obj == NULL) {
         return send_json_error(connection, MHD_HTTP_BAD_REQUEST, "缺少必要的请求数据");
     }
@@ -1281,8 +1220,7 @@ int handle_verify_signature(struct MHD_Connection *connection, const char *uploa
     json_object_object_add(response_obj, "reconstructedPublicKey", json_object_new_string(pubkey_hex));
     
     int ret = send_json_response(connection, MHD_HTTP_OK, response_obj, "POST, OPTIONS");
-    
-    // 释放资源
+
     json_object_put(response_obj);
     json_object_put(request_obj);
     free(pubkey_hex);
@@ -1299,15 +1237,13 @@ int handle_revoke_certificate(struct MHD_Connection *connection, const char *upl
     static char *request_buffer = NULL;
     struct json_object *request_obj = NULL;
     
-    // 解析POST数据
     request_obj = parse_post_data(connection, &request_buffer, upload_data, upload_data_size);
     
     // 如果是第一次调用或者没有POST数据，直接返回
     if (request_obj == NULL && request_buffer != NULL) {
         return MHD_YES;
     }
-    
-    // 没有POST数据
+
     if (request_obj == NULL) {
         return send_json_error(connection, MHD_HTTP_BAD_REQUEST, "缺少必要的请求数据");
     }
@@ -1345,11 +1281,9 @@ int handle_revoke_certificate(struct MHD_Connection *connection, const char *upl
     } else {
         json_object_object_add(response_obj, "message", json_object_new_string("证书撤销失败"));
     }
-    
-    // 发送响应
+
     int ret = send_json_response(connection, MHD_HTTP_OK, response_obj, "POST, OPTIONS");
-    
-    // 清理资源
+
     json_object_put(response_obj);
     json_object_put(request_obj);
     

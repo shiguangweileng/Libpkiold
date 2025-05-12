@@ -577,7 +577,7 @@ CRLManager* CRLManager_load_from_file(const char* filename) {
     if (!filename) return NULL;
     
     FILE* file = fopen(filename, "rb");
-    if (!file) return NULL;
+    if (!file) return CRLManager_init(512, 512);
     
     // 读取基本信息
     int base_v, capacity, removed_v, removed_capacity;
