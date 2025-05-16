@@ -11,33 +11,13 @@
 #include "include/common.h"
 #include "include/imp_cert.h"
 #include "include/gm_crypto.h"
+#include "include/web_protocol.h"
 
-#define PORT 8888
+#define WEB_PORT 8888
 #define CA_PORT 8001
 #define CA_IP "127.0.0.1"
-#define BUFFER_SIZE 8192
-#define MSG_HEADER_SIZE 3
 #define USER_DATA_DIR "server/ca-server/UserData/"
 #define USER_CERTS_DIR "server/ca-server/UserCerts/"
-
-// Web通信协议命令（需要与ca.c中定义的一致）
-#define WEB_CMD_GET_USERS      0x81    // ca_web请求获取用户列表
-#define WEB_CMD_USER_LIST      0x82    // ca向ca_web发送用户列表
-#define WEB_CMD_GET_CERT       0x83    // ca_web请求获取特定用户证书
-#define WEB_CMD_CERT_DATA      0x84    // ca向ca_web发送证书数据
-#define WEB_CMD_GET_CRL        0x85    // ca_web请求获取证书撤销列表
-#define WEB_CMD_CRL_DATA       0x86    // ca向ca_web发送证书撤销列表数据
-#define WEB_CMD_CLEANUP_CERTS  0x87    // ca_web请求清理过期证书
-#define WEB_CMD_CLEANUP_RESULT 0x88    // ca向ca_web发送清理结果
-#define WEB_CMD_LOCAL_GEN_CERT 0x89    // ca_web请求本地生成证书
-#define WEB_CMD_LOCAL_UPD_CERT 0x8A    // ca_web请求本地更新证书
-#define WEB_CMD_LOCAL_RESULT   0x8B    // ca向ca_web发送本地操作结果
-#define WEB_CMD_REVOKE_CERT    0x8C    // ca_web请求撤销证书
-#define WEB_CMD_REVOKE_RESULT  0x8D    // ca向ca_web发送撤销结果
-
-// 用户数据结构
-#define SUBJECT_ID_SIZE 9   // 8字符ID + 结束符
-#define CERT_HASH_SIZE 32   // 证书哈希32字节
 
 typedef struct {
     char id[SUBJECT_ID_SIZE];
@@ -70,19 +50,7 @@ unsigned char Q_ca[SM2_PUB_MAX_SIZE]; // CA公钥，用于重构用户公钥
 
 // ============ 函数声明部分，按功能分组 ============
 
-// 网络通信相关函数
-int connect_to_ca();
-int send_message(int sock, uint8_t cmd, const void *data, uint16_t data_len);
-int recv_message(int sock, uint8_t *cmd, void *data, uint16_t max_len);
-
-// CA通信请求函数
-int request_user_list();
-int request_user_certificate(const char *user_id, unsigned char *cert_data, int max_size);
-int request_crl_list();
-int request_cleanup_expired_certs();
-int request_local_gen_cert(const char *user_id);
-int request_local_upd_cert(const char *user_id);
-int request_revoke_cert(const char *user_id);
+// CA通信请求函数 - 使用web_protocol.h中的函数
 
 // HTTP处理函数
 int handle_cors_preflight(struct MHD_Connection *connection);
@@ -144,14 +112,14 @@ int main() {
     }
     
     // 启动HTTP服务器
-    daemon = MHD_start_daemon(MHD_USE_INTERNAL_POLLING_THREAD, PORT, NULL, NULL,
+    daemon = MHD_start_daemon(MHD_USE_INTERNAL_POLLING_THREAD, WEB_PORT, NULL, NULL,
                              &request_handler, NULL, MHD_OPTION_END);
     if (daemon == NULL) {
         fprintf(stderr, "无法启动HTTP服务器\n");
         return 1;
     }
     
-    printf("CA Web服务器已启动，监听端口: %d\n", PORT);
+    printf("CA Web服务器已启动，监听端口: %d\n", WEB_PORT);
     printf("按Enter键停止服务器...\n");
     getchar();
     
@@ -271,463 +239,6 @@ struct json_object* parse_post_data(struct MHD_Connection *connection,
     return request_obj;
 }
 
-// ---- 网络通信相关函数 ----
-
-// 连接到CA服务器
-int connect_to_ca() {
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock < 0) {
-        perror("Socket创建失败");
-        return -1;
-    }
-    
-    struct sockaddr_in serv_addr;
-    memset(&serv_addr, 0, sizeof(serv_addr));
-    serv_addr.sin_family = AF_INET;
-    serv_addr.sin_port = htons(CA_PORT);
-    
-    if (inet_pton(AF_INET, CA_IP, &serv_addr.sin_addr) <= 0) {
-        perror("IP地址无效");
-        close(sock);
-        return -1;
-    }
-    
-    if (connect(sock, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
-        perror("连接CA失败");
-        close(sock);
-        return -1;
-    }
-    
-    return sock;
-}
-
-// 发送消息到指定socket
-int send_message(int sock, uint8_t cmd, const void *data, uint16_t data_len) {
-    unsigned char header[MSG_HEADER_SIZE];
-    
-    // 构建消息头：命令(1字节) + 数据长度(2字节，网络字节序)
-    header[0] = cmd;
-    header[1] = (data_len >> 8) & 0xFF;
-    header[2] = data_len & 0xFF;
-    
-    // 发送消息头
-    if (send(sock, header, MSG_HEADER_SIZE, 0) != MSG_HEADER_SIZE) {
-        perror("发送消息头失败");
-        return 0;
-    }
-    
-    // 发送消息体（如果有）
-    if (data_len > 0 && data != NULL) {
-        if (send(sock, data, data_len, 0) != data_len) {
-            perror("发送消息体失败");
-            return 0;
-        }
-    }
-    
-    return 1;
-}
-
-// 从指定socket接收消息
-int recv_message(int sock, uint8_t *cmd, void *data, uint16_t max_len) {
-    unsigned char header[MSG_HEADER_SIZE];
-    
-    // 接收消息头
-    int bytes_received = recv(sock, header, MSG_HEADER_SIZE, 0);
-    if (bytes_received != MSG_HEADER_SIZE) {
-        if (bytes_received == 0) {
-            // 连接已关闭
-            return -1;
-        }
-        perror("接收消息头失败");
-        return -1;
-    }
-    
-    // 解析消息头
-    *cmd = header[0];
-    uint16_t data_len = (header[1] << 8) | header[2];
-    
-    // 验证数据长度
-    if (data_len > max_len) {
-        fprintf(stderr, "数据太长: %d > %d\n", data_len, max_len);
-        return -1;
-    }
-    
-    // 接收消息体（如果有）
-    if (data_len > 0) {
-        bytes_received = recv(sock, data, data_len, 0);
-        if (bytes_received != data_len) {
-            perror("接收消息体失败");
-            return -1;
-        }
-    }
-    
-    return data_len;
-}
-
-// ---- CA通信请求函数 ----
-
-// 请求用户列表
-int request_user_list() {
-    int result = 0;
-    unsigned char buffer[BUFFER_SIZE];
-    int data_len;
-    uint8_t cmd;
-    
-    // 锁定CA连接
-    pthread_mutex_lock(&ca_socket_mutex);
-    
-    // 检查连接是否有效
-    if (ca_socket < 0) {
-        pthread_mutex_unlock(&ca_socket_mutex);
-        return 0;
-    }
-    
-    // 发送请求
-    if (!send_message(ca_socket, WEB_CMD_GET_USERS, NULL, 0)) {
-        pthread_mutex_unlock(&ca_socket_mutex);
-        return 0;
-    }
-    
-    // 接收响应
-    data_len = recv_message(ca_socket, &cmd, buffer, BUFFER_SIZE);
-    
-    if (data_len < 0 || cmd != WEB_CMD_USER_LIST) {
-        pthread_mutex_unlock(&ca_socket_mutex);
-        return 0;
-    }
-    
-    // 解析响应数据
-    if (data_len >= sizeof(int)) {
-        int new_user_count = 0;
-        memcpy(&new_user_count, buffer, sizeof(int));
-        
-        // 检查数据大小是否合理
-        if (data_len == sizeof(int) + new_user_count * (SUBJECT_ID_SIZE + CERT_HASH_SIZE)) {
-            pthread_mutex_lock(&users_mutex);
-            // 释放旧数据
-            if (users) {
-                free(users);
-                users = NULL;
-                user_count = 0;
-            }
-            // 分配新内存
-            if (new_user_count > 0) {
-                users = (UserInfo*)malloc(sizeof(UserInfo) * new_user_count);
-                if (users) {
-                    user_count = new_user_count;
-                    
-                    // 解析用户数据
-                    int offset = sizeof(int);
-                    for (int i = 0; i < user_count; i++) {
-                        // 复制用户ID
-                        memcpy(users[i].id, buffer + offset, SUBJECT_ID_SIZE);
-                        offset += SUBJECT_ID_SIZE;
-                        
-                        // 复制证书哈希
-                        memcpy(users[i].cert_hash, buffer + offset, CERT_HASH_SIZE);
-                        offset += CERT_HASH_SIZE;
-                    }
-                    result = 1;
-                }
-            } else {
-                // 空列表
-                result = 1;
-            }
-            pthread_mutex_unlock(&users_mutex);
-        }
-    }
-    
-    // 解锁CA连接
-    pthread_mutex_unlock(&ca_socket_mutex);
-    
-    return result;
-}
-
-// 请求CRL列表
-int request_crl_list() {
-    int result = 0;
-    unsigned char buffer[BUFFER_SIZE];
-    int data_len;
-    uint8_t cmd;
-
-    pthread_mutex_lock(&ca_socket_mutex);
-    
-    // 检查连接是否有效
-    if (ca_socket < 0) {
-        pthread_mutex_unlock(&ca_socket_mutex);
-        return 0;
-    }
-    
-    if (!send_message(ca_socket, WEB_CMD_GET_CRL, NULL, 0)) {
-        pthread_mutex_unlock(&ca_socket_mutex);
-        return 0;
-    }
-    
-    data_len = recv_message(ca_socket, &cmd, buffer, BUFFER_SIZE);
-    
-    if (data_len < 0 || cmd != WEB_CMD_CRL_DATA) {
-        pthread_mutex_unlock(&ca_socket_mutex);
-        return 0;
-    }
-    
-    // 解析响应数据
-    if (data_len >= sizeof(int) * 3) { // 至少包含基础版本号、删除版本号和CRL条目数
-        int offset = 0;
-        
-        // 读取基础版本号
-        memcpy(&crl_version.base_v, buffer + offset, sizeof(int));
-        offset += sizeof(int);
-        
-        // 读取删除版本号
-        memcpy(&crl_version.removed_v, buffer + offset, sizeof(int));
-        offset += sizeof(int);
-        
-        // 读取CRL条目数
-        int new_crl_count = 0;
-        memcpy(&new_crl_count, buffer + offset, sizeof(int));
-        offset += sizeof(int);
-        
-        // 检查数据大小是否合理
-        if (data_len == sizeof(int) * 3 + new_crl_count * (CERT_HASH_SIZE + sizeof(time_t))) {
-            pthread_mutex_lock(&crl_mutex);
-            
-            // 释放旧数据
-            if (crl_entries) {
-                free(crl_entries);
-                crl_entries = NULL;
-                crl_count = 0;
-            }
-            
-            // 分配新内存
-            if (new_crl_count > 0) {
-                crl_entries = (CRLEntry*)malloc(sizeof(CRLEntry) * new_crl_count);
-                if (crl_entries) {
-                    crl_count = new_crl_count;
-                    
-                    // 解析CRL数据
-                    for (int i = 0; i < crl_count; i++) {
-                        // 复制证书哈希
-                        memcpy(crl_entries[i].cert_hash, buffer + offset, CERT_HASH_SIZE);
-                        offset += CERT_HASH_SIZE;
-                        
-                        // 复制到期时间
-                        memcpy(&crl_entries[i].expire_time, buffer + offset, sizeof(time_t));
-                        offset += sizeof(time_t);
-                    }
-                    result = 1;
-                }
-            } else {
-                // 空列表
-                result = 1;
-            }
-            pthread_mutex_unlock(&crl_mutex);
-        }
-    }
-    pthread_mutex_unlock(&ca_socket_mutex);
-    return result;
-}
-
-// 请求获取用户证书
-int request_user_certificate(const char *user_id, unsigned char *cert_data, int max_size) {
-    unsigned char buffer[BUFFER_SIZE];
-    int data_len;
-    uint8_t cmd;
-    int result = 0;
-
-    pthread_mutex_lock(&ca_socket_mutex);
-    if (ca_socket < 0) {
-        pthread_mutex_unlock(&ca_socket_mutex);
-        return 0;
-    }
-    
-    // 发送请求，包含用户ID
-    if (!send_message(ca_socket, WEB_CMD_GET_CERT, user_id, strlen(user_id) + 1)) {
-        pthread_mutex_unlock(&ca_socket_mutex);
-        return 0;
-    }
-    
-    // 接收响应
-    data_len = recv_message(ca_socket, &cmd, buffer, BUFFER_SIZE);
-    
-    if (data_len <= 0 || cmd != WEB_CMD_CERT_DATA) {
-        pthread_mutex_unlock(&ca_socket_mutex);
-        return 0;
-    }
-    
-    // 响应数据为空，表示没有找到证书或出错
-    if (data_len == 0) {
-        pthread_mutex_unlock(&ca_socket_mutex);
-        return 0;
-    }
-    
-    // 复制证书数据
-    if (data_len <= max_size) {
-        memcpy(cert_data, buffer, data_len);
-        result = data_len;
-    }
-
-    pthread_mutex_unlock(&ca_socket_mutex);
-    return result;
-}
-
-// 请求清理过期证书
-int request_cleanup_expired_certs() {
-    unsigned char buffer[BUFFER_SIZE];
-    int data_len;
-    uint8_t cmd;
-    int cleaned_count = 0;
-
-    pthread_mutex_lock(&ca_socket_mutex);
-    
-    // 检查连接是否有效
-    if (ca_socket < 0) {
-        pthread_mutex_unlock(&ca_socket_mutex);
-        return -1;
-    }
-    
-    if (!send_message(ca_socket, WEB_CMD_CLEANUP_CERTS, NULL, 0)) {
-        pthread_mutex_unlock(&ca_socket_mutex);
-        return -1;
-    }
-    data_len = recv_message(ca_socket, &cmd, buffer, BUFFER_SIZE);
-    
-    if (data_len < 0 || cmd != WEB_CMD_CLEANUP_RESULT) {
-        pthread_mutex_unlock(&ca_socket_mutex);
-        return -1;
-    }
-    
-    // 解析响应数据（清理的证书数量）
-    if (data_len >= sizeof(int)) {
-        memcpy(&cleaned_count, buffer, sizeof(int));
-    }
-    pthread_mutex_unlock(&ca_socket_mutex);
-    
-    return cleaned_count;
-}
-
-// 请求本地生成证书
-int request_local_gen_cert(const char *user_id) {
-    int result = 0;
-    unsigned char buffer[BUFFER_SIZE];
-    uint8_t cmd;
-    int data_len;
-    
-    pthread_mutex_lock(&ca_socket_mutex);
-    // 检查是否需要重新连接CA
-    if (ca_socket < 0) {
-        ca_socket = connect_to_ca();
-        if (ca_socket < 0) {
-            pthread_mutex_unlock(&ca_socket_mutex);
-            return 0;
-        }
-    }
-
-    if (!send_message(ca_socket, WEB_CMD_LOCAL_GEN_CERT, user_id, strlen(user_id) + 1)) {
-        close(ca_socket);
-        ca_socket = -1;
-        pthread_mutex_unlock(&ca_socket_mutex);
-        return 0;
-    }
-    data_len = recv_message(ca_socket, &cmd, buffer, BUFFER_SIZE);
-    
-    if (data_len < 0 || cmd != WEB_CMD_LOCAL_RESULT) {
-        close(ca_socket);
-        ca_socket = -1;
-        pthread_mutex_unlock(&ca_socket_mutex);
-        return 0;
-    }
-    
-    // 处理响应结果
-    if (data_len > 0) {
-        // 结果为1字节，1表示成功，0表示失败
-        result = buffer[0];
-    }
-    
-    pthread_mutex_unlock(&ca_socket_mutex);
-    return result;
-}
-
-// 请求本地更新证书
-int request_local_upd_cert(const char *user_id) {
-    int result = 0;
-    unsigned char buffer[BUFFER_SIZE];
-    uint8_t cmd;
-    int data_len;
-
-    pthread_mutex_lock(&ca_socket_mutex);
-    if (ca_socket < 0) {
-        ca_socket = connect_to_ca();
-        if (ca_socket < 0) {
-            pthread_mutex_unlock(&ca_socket_mutex);
-            return 0;
-        }
-    }
-
-    if (!send_message(ca_socket, WEB_CMD_LOCAL_UPD_CERT, user_id, strlen(user_id) + 1)) {
-        close(ca_socket);
-        ca_socket = -1;
-        pthread_mutex_unlock(&ca_socket_mutex);
-        return 0;
-    }
-
-    data_len = recv_message(ca_socket, &cmd, buffer, BUFFER_SIZE);
-    if (data_len < 0 || cmd != WEB_CMD_LOCAL_RESULT) {
-        close(ca_socket);
-        ca_socket = -1;
-        pthread_mutex_unlock(&ca_socket_mutex);
-        return 0;
-    }
-    
-    // 处理响应结果
-    if (data_len > 0) {
-        // 结果为1字节，1表示成功，0表示失败
-        result = buffer[0];
-    }
-    
-    pthread_mutex_unlock(&ca_socket_mutex);
-    return result;
-}
-
-// 请求撤销证书
-int request_revoke_cert(const char *user_id) {
-    int result = 0;
-    unsigned char buffer[BUFFER_SIZE];
-    uint8_t cmd;
-    int data_len;
-
-    pthread_mutex_lock(&ca_socket_mutex);
-    if (ca_socket < 0) {
-        ca_socket = connect_to_ca();
-        if (ca_socket < 0) {
-            pthread_mutex_unlock(&ca_socket_mutex);
-            return 0;
-        }
-    }
-
-    if (!send_message(ca_socket, WEB_CMD_REVOKE_CERT, user_id, strlen(user_id) + 1)) {
-        close(ca_socket);
-        ca_socket = -1;
-        pthread_mutex_unlock(&ca_socket_mutex);
-        return 0;
-    }
-    data_len = recv_message(ca_socket, &cmd, buffer, BUFFER_SIZE);
-    if (data_len < 0 || cmd != WEB_CMD_REVOKE_RESULT) {
-        close(ca_socket);
-        ca_socket = -1;
-        pthread_mutex_unlock(&ca_socket_mutex);
-        return 0;
-    }
-    
-    // 处理响应结果
-    if (data_len > 0) {
-        // 结果为1字节，1表示成功，0表示失败
-        result = buffer[0];
-    }
-    
-    pthread_mutex_unlock(&ca_socket_mutex);
-    return result;
-}
-
 // ---- HTTP处理函数 ----
 
 // 处理CORS预检请求
@@ -744,6 +255,23 @@ int handle_cors_preflight(struct MHD_Connection *connection) {
 
 // 处理用户列表请求
 int handle_user_list(struct MHD_Connection *connection) {
+    // 先从CA请求最新的用户列表数据
+    pthread_mutex_lock(&ca_socket_mutex);
+    void *new_users = NULL;
+    int new_user_count = 0;
+    if (ca_socket >= 0) {
+        if (request_user_list(ca_socket, &new_users, &new_user_count)) {
+            pthread_mutex_lock(&users_mutex);
+            if (users) {
+                free(users);
+            }
+            users = (UserInfo*)new_users;
+            user_count = new_user_count;
+            pthread_mutex_unlock(&users_mutex);
+        }
+    }
+    pthread_mutex_unlock(&ca_socket_mutex);
+
     struct json_object *response_obj = json_object_new_array();
 
     pthread_mutex_lock(&users_mutex);
@@ -774,7 +302,32 @@ int handle_user_list(struct MHD_Connection *connection) {
 // 处理证书撤销列表请求
 int handle_crl_list(struct MHD_Connection *connection) {
     // 先从CA请求最新的CRL数据
-    request_crl_list();
+    pthread_mutex_lock(&ca_socket_mutex);
+    void *new_crl_entries = NULL;
+    int new_crl_count = 0;
+    int new_base_v = 0;
+    int new_removed_v = 0;
+    
+    if (ca_socket >= 0) {
+        request_crl_list(ca_socket, &new_crl_entries, &new_crl_count, &new_base_v, &new_removed_v);
+        
+        pthread_mutex_lock(&crl_mutex);
+        // 更新版本信息
+        crl_version.base_v = new_base_v;
+        crl_version.removed_v = new_removed_v;
+        
+        // 释放旧数据
+        if (crl_entries) {
+            free(crl_entries);
+        }
+        
+        // 更新CRL数据
+        crl_entries = (CRLEntry*)new_crl_entries;
+        crl_count = new_crl_count;
+        
+        pthread_mutex_unlock(&crl_mutex);
+    }
+    pthread_mutex_unlock(&ca_socket_mutex);
     
     // 创建一个包含版本信息和CRL数据的对象
     struct json_object *response_obj = json_object_new_object();
@@ -824,9 +377,17 @@ int handle_user_certificate(struct MHD_Connection *connection, const char *url) 
     if (!user_id || strlen(user_id) != 8) {
         return send_json_error(connection, MHD_HTTP_BAD_REQUEST, "无效的用户ID");
     }
+    
     // 请求证书数据，格式：证书结构体 + 哈希值(32字节) + 有效性标志(1字节) + 撤销标志(1字节)
     unsigned char cert_data[BUFFER_SIZE];
-    int data_len = request_user_certificate(user_id, cert_data, BUFFER_SIZE);
+    
+    pthread_mutex_lock(&ca_socket_mutex);
+    int data_len = 0;
+    if (ca_socket >= 0) {
+        data_len = request_user_certificate(ca_socket, user_id, cert_data, BUFFER_SIZE);
+    }
+    pthread_mutex_unlock(&ca_socket_mutex);
+    
     if (data_len <= 0) {
         return send_json_error(connection, MHD_HTTP_NOT_FOUND, "无法获取用户证书");
     }
@@ -879,7 +440,14 @@ int handle_user_certificate(struct MHD_Connection *connection, const char *url) 
 // 处理清理过期证书请求
 int handle_cleanup_expired_certs(struct MHD_Connection *connection) {
     // 请求清理过期证书
-    int cleaned_count = request_cleanup_expired_certs();
+    int cleaned_count = -1;
+    
+    pthread_mutex_lock(&ca_socket_mutex);
+    if (ca_socket >= 0) {
+        cleaned_count = request_cleanup_expired_certs(ca_socket);
+    }
+    pthread_mutex_unlock(&ca_socket_mutex);
+    
     struct json_object *response_obj = json_object_new_object();
     
     if (cleaned_count >= 0) {
@@ -964,11 +532,25 @@ int handle_local_cert_operation(struct MHD_Connection *connection, const char *u
     }
     
     // 执行本地证书操作
-    if (is_generate) {
-        result = request_local_gen_cert(user_id);
-    } else {
-        result = request_local_upd_cert(user_id);
+    pthread_mutex_lock(&ca_socket_mutex);
+    if (ca_socket < 0) {
+        ca_socket = connect_to_server(CA_IP, CA_PORT);
     }
+    
+    if (ca_socket >= 0) {
+        if (is_generate) {
+            result = request_local_gen_cert(ca_socket, user_id);
+        } else {
+            result = request_local_upd_cert(ca_socket, user_id);
+        }
+        
+        // 如果请求失败，尝试重新连接
+        if (result == 0) {
+            close(ca_socket);
+            ca_socket = -1;
+        }
+    }
+    pthread_mutex_unlock(&ca_socket_mutex);
     
     // 构建响应
     response_obj = json_object_new_object();
@@ -1270,7 +852,22 @@ int handle_revoke_certificate(struct MHD_Connection *connection, const char *upl
     }
     
     // 请求撤销证书
-    int result = request_revoke_cert(user_id);
+    int result = 0;
+    pthread_mutex_lock(&ca_socket_mutex);
+    if (ca_socket < 0) {
+        ca_socket = connect_to_server(CA_IP, CA_PORT);
+    }
+    
+    if (ca_socket >= 0) {
+        result = request_revoke_cert(ca_socket, user_id);
+        
+        // 如果请求失败，尝试重新连接
+        if (result == 0) {
+            close(ca_socket);
+            ca_socket = -1;
+        }
+    }
+    pthread_mutex_unlock(&ca_socket_mutex);
     
     // 构建响应
     struct json_object *response_obj = json_object_new_object();
@@ -1306,8 +903,6 @@ enum MHD_Result request_handler(void *cls, struct MHD_Connection *connection,
     // GET请求处理
     if (strcmp(method, "GET") == 0) {
         if (strcmp(url, "/api/users") == 0) {
-            // 先从CA请求最新的用户列表数据
-            request_user_list();
             return handle_user_list(connection);
         } else if (strcmp(url, "/api/crl") == 0) {
             return handle_crl_list(connection);
@@ -1354,7 +949,7 @@ void* ca_comm_thread_func(void* arg) {
         pthread_mutex_lock(&ca_socket_mutex);
         if (ca_socket < 0) {
             printf("正在连接CA服务器...\n");
-            ca_socket = connect_to_ca();
+            ca_socket = connect_to_server(CA_IP, CA_PORT);
             
             if (ca_socket < 0) {
                 retry_count++;
@@ -1376,8 +971,38 @@ void* ca_comm_thread_func(void* arg) {
         pthread_mutex_unlock(&ca_socket_mutex);
         
         // 定期请求用户列表和CRL列表更新
-        request_user_list();
-        request_crl_list();
+        pthread_mutex_lock(&ca_socket_mutex);
+        if (ca_socket >= 0) {
+            void *new_users = NULL;
+            int new_user_count = 0;
+            if (request_user_list(ca_socket, &new_users, &new_user_count)) {
+                pthread_mutex_lock(&users_mutex);
+                if (users) {
+                    free(users);
+                }
+                users = (UserInfo*)new_users;
+                user_count = new_user_count;
+                pthread_mutex_unlock(&users_mutex);
+            }
+            
+            void *new_crl_entries = NULL;
+            int new_crl_count = 0;
+            int new_base_v = 0;
+            int new_removed_v = 0;
+            if (request_crl_list(ca_socket, &new_crl_entries, &new_crl_count, &new_base_v, &new_removed_v)) {
+                pthread_mutex_lock(&crl_mutex);
+                crl_version.base_v = new_base_v;
+                crl_version.removed_v = new_removed_v;
+                if (crl_entries) {
+                    free(crl_entries);
+                }
+                crl_entries = (CRLEntry*)new_crl_entries;
+                crl_count = new_crl_count;
+                pthread_mutex_unlock(&crl_mutex);
+            }
+        }
+        pthread_mutex_unlock(&ca_socket_mutex);
+        
         // 每60秒更新一次
         sleep(60);
     }

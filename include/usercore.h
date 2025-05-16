@@ -24,15 +24,15 @@ extern int has_cert;
 int init_crl_manager();
 int load_crl_manager_to_hashmap();
 int check_cert_in_local_crl(const unsigned char *cert_hash);
-int sync_crl_with_ca(int sock);
-int online_csp(int sock, const unsigned char *cert_hash);
+int sync_crl_with_ca();
+int online_csp(const unsigned char *cert_hash);
 int local_csp(const unsigned char *cert_hash);
 
 // 用户操作
 int load_keys_and_cert(const char *user_id);
-int request_registration(int sock, const char *user_id);
-int request_cert_update(int sock, const char *user_id);
-int request_cert_revoke(int sock, const char *user_id);
-int send_signed_message(int sock, const char *user_id, const char *message);
+int request_registration(const char *user_id);
+int request_cert_update(const char *user_id);
+int request_cert_revoke(const char *user_id);
+int send_signed_message(const char *user_id, const char *message);
 
 #endif /* USER_H */ 

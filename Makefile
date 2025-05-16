@@ -4,23 +4,23 @@ OPENSSL_DIR = /usr/local/openssl
 CFLAGS = -I./include -I$(OPENSSL_DIR)/include -L$(OPENSSL_DIR)/lib64 -l:libcrypto.so.3 -lpthread
 SRC_FILES = $(wildcard src/*.c)
 
-WEB_CFLAGS = -I./include src/common.c src/imp_cert.c src/gm_crypto.c
+WEB_CFLAGS = -I./include src/common.c src/imp_cert.c src/gm_crypto.c src/web_protocol.c
 
 all: ca user test web
 
 ca:
 	@echo "正在编译CA服务器..."
-	$(CC) server/ca-server/ca.c $(SRC_FILES) $(CFLAGS) -o server/ca-server/ca
+	$(CC) server/ca-server/ca.c $(SRC_FILES) $(CFLAGS) -lmicrohttpd -o server/ca-server/ca
 	@echo "CA服务器编译成功！"
 
 user:
 	@echo "正在编译User客户端..."
-	$(CC) server/user-client/user.c $(SRC_FILES) $(CFLAGS) -o server/user-client/user
+	$(CC) server/user-client/user.c $(SRC_FILES) $(CFLAGS) -lcurl -o server/user-client/user
 	@echo "User客户端编译成功！"
 
 test:
 	@echo "正在编译func_test测试程序..."
-	$(CC) server/user-client/func_test.c server/user-client/usercore.c $(SRC_FILES) $(CFLAGS) -o server/user-client/func_test
+	$(CC) server/user-client/func_test.c server/user-client/usercore.c $(SRC_FILES) $(CFLAGS) -lcurl -o server/user-client/func_test
 	@echo "func_test测试程序编译成功！"
 
 web: 

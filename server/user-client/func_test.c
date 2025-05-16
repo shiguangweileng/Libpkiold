@@ -6,7 +6,6 @@
 #include "common.h"
 #include "gm_crypto.h"
 #include "imp_cert.h"
-#include "network.h"
 #include "usercore.h"
 
 // CA服务器配置
@@ -42,7 +41,6 @@ double end_timer(struct timeval *start_time) {
 
 // 测试10个用户注册并记录时间
 int test_multi_user_registration() {
-    int sock;
     int result;
     struct timeval start_time;
     double elapsed_ms;
@@ -59,21 +57,11 @@ int test_multi_user_registration() {
         
         printf("正在注册用户 %s...\n", user_id);
         
-        // 开始计时（在连接前）
+        // 开始计时
         start_timer(&start_time);
         
-        // 连接到服务器
-        sock = connect_to_server(CA_SERVER_IP, PORT);
-        if (sock < 0) {
-            printf("无法连接到服务器，请确保CA服务器正在运行\n");
-            return 0;
-        }
-        
         // 执行证书注册
-        result = request_registration(sock, user_id);
-        
-        // 关闭连接
-        close(sock);
+        result = request_registration(user_id);
         
         // 结束计时
         elapsed_ms = end_timer(&start_time);
@@ -96,7 +84,6 @@ int test_multi_user_registration() {
 
 // 测试用户证书更新10次
 int test_user_cert_update() {
-    int sock;
     int result;
     struct timeval start_time;
     double elapsed_ms;
@@ -111,16 +98,8 @@ int test_user_cert_update() {
     if (!has_cert) {
         printf("用户 %s 证书不存在，先进行注册...\n", user_id);
         
-        // 连接到服务器
-        sock = connect_to_server(CA_SERVER_IP, PORT);
-        if (sock < 0) {
-            printf("无法连接到服务器，请确保CA服务器正在运行\n");
-            return 0;
-        }
-        
         // 执行证书注册
-        result = request_registration(sock, user_id);
-        close(sock);
+        result = request_registration(user_id);
         
         if (!result) {
             printf("用户 %s 注册失败，无法进行更新测试\n", user_id);
@@ -141,21 +120,11 @@ int test_user_cert_update() {
     for (int i = 1; i <= 10; i++) {
         printf("正在进行第 %d 次证书更新...\n", i);
         
-        // 开始计时（在连接前）
+        // 开始计时
         start_timer(&start_time);
         
-        // 连接到服务器
-        sock = connect_to_server(CA_SERVER_IP, PORT);
-        if (sock < 0) {
-            printf("无法连接到服务器，请确保CA服务器正在运行\n");
-            return success_count;
-        }
-        
         // 执行证书更新
-        result = request_cert_update(sock, user_id);
-        
-        // 关闭连接
-        close(sock);
+        result = request_cert_update(user_id);
         
         // 结束计时
         elapsed_ms = end_timer(&start_time);
@@ -184,7 +153,6 @@ int test_user_cert_update() {
 
 // 测试用户证书撤销
 int test_cert_revocation() {
-    int sock;
     int result;
     struct timeval start_time;
     double elapsed_ms;
@@ -198,16 +166,8 @@ int test_cert_revocation() {
     if (!has_cert) {
         printf("用户 %s 证书不存在，先进行注册...\n", user_id);
         
-        // 连接到服务器
-        sock = connect_to_server(CA_SERVER_IP, PORT);
-        if (sock < 0) {
-            printf("无法连接到服务器，请确保CA服务器正在运行\n");
-            return 0;
-        }
-        
         // 执行证书注册
-        result = request_registration(sock, user_id);
-        close(sock);
+        result = request_registration(user_id);
         
         if (!result) {
             printf("用户 %s 注册失败，无法进行撤销测试\n", user_id);
@@ -244,18 +204,8 @@ int test_cert_revocation() {
     // 开始计时
     start_timer(&start_time);
     
-    // 连接到服务器
-    sock = connect_to_server(CA_SERVER_IP, PORT);
-    if (sock < 0) {
-        printf("无法连接到服务器，请确保CA服务器正在运行\n");
-        return 0;
-    }
-    
     // 执行证书撤销
-    result = request_cert_revoke(sock, user_id);
-    
-    // 关闭连接
-    close(sock);
+    result = request_cert_revoke(user_id);
     
     // 结束计时
     elapsed_ms = end_timer(&start_time);
@@ -272,7 +222,6 @@ int test_cert_revocation() {
 
 // 测试证书状态比对和CRL同步
 int test_cert_status_check() {
-    int sock;
     int result;
     int online_status,local_status;
     struct timeval start_time;
@@ -304,14 +253,8 @@ int test_cert_status_check() {
     
     // 第一次在线+本地证书状态查询
     start_timer(&start_time);
-    sock = connect_to_server(CA_SERVER_IP, PORT);
-    if (sock < 0) {
-        printf("无法连接到服务器，请确保CA服务器正在运行\n");
-        return 0;
-    }
-    online_status = online_csp(sock, revoked_cert_hash);
+    online_status = online_csp(revoked_cert_hash);
     printf("online_csp:%s\n", online_status ? "有效" : "无效（已撤销）");
-    close(sock);
     local_status = local_csp(revoked_cert_hash);
     printf("local_csp:%s\n", local_status ? "有效" : "无效（已撤销）");
     elapsed_ms = end_timer(&start_time);
@@ -319,15 +262,9 @@ int test_cert_status_check() {
     
     // 同步CRL
     printf("\n正在与CA服务器同步CRL...\n");
-    sock = connect_to_server(CA_SERVER_IP, PORT);
-    if (sock < 0) {
-        printf("无法连接到服务器，请确保CA服务器正在运行\n");
-        return 0;
-    }
     start_timer(&start_time);
-    result = sync_crl_with_ca(sock);
+    result = sync_crl_with_ca();
     elapsed_ms = end_timer(&start_time);
-    close(sock);
     
     if (result) {
         printf("CRL同步成功，耗时: %.2fms\n", elapsed_ms);
@@ -338,14 +275,8 @@ int test_cert_status_check() {
     
     // 第二次在线+本地证书状态查询
     start_timer(&start_time);
-    sock = connect_to_server(CA_SERVER_IP, PORT);
-    if (sock < 0) {
-        printf("无法连接到服务器，请确保CA服务器正在运行\n");
-        return 0;
-    }
-    online_status = online_csp(sock, revoked_cert_hash);
+    online_status = online_csp(revoked_cert_hash);
     printf("online_csp:%s\n", online_status ? "有效" : "无效（已撤销）");
-    close(sock);
     local_status = local_csp(revoked_cert_hash);
     printf("local_csp:%s\n", local_status ? "有效" : "无效（已撤销）");
     elapsed_ms = end_timer(&start_time);
