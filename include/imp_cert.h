@@ -3,6 +3,8 @@
 
 #include <time.h>
 #include "common.h"
+#include <openssl/asn1.h>
+#include <openssl/asn1t.h>
 
 
 #define SERIAL_NUM_FORMAT "SN%06d"       // 序列号格式，6位数字前缀为SN
@@ -18,6 +20,19 @@ typedef struct {
     unsigned char Validity[16];  // 有效期: 前8字节开始时间，后8字节结束时间
     unsigned char PubKey[33];    // 公钥
 } ImpCert;
+
+// ASN.1结构定义 - DER编码所需
+typedef struct ImpCertAsn1_st {
+    ASN1_UTF8STRING *serialNum;
+    ASN1_UTF8STRING *issuerID;
+    ASN1_UTF8STRING *subjectID;
+    ASN1_INTEGER *startTime;
+    ASN1_INTEGER *endTime;
+    ASN1_OCTET_STRING *pubKey;
+} ImpCertAsn1;
+
+// ASN.1序列化声明
+DECLARE_ASN1_FUNCTIONS(ImpCertAsn1)
 
 
 EXPORT int validate_cert(const ImpCert *cert);

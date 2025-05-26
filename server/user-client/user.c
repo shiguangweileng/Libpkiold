@@ -4,16 +4,23 @@
 #include <unistd.h>
 #include <sys/time.h>
 #include <sys/socket.h>
+#include <curl/curl.h>
 #include "common.h"
 #include "gm_crypto.h"
 #include "imp_cert.h"
 #include "hashmap.h"
 #include "crlmanager.h"
-#include "network.h"
 
 #define CRL_MANAGER_FILE "CRLManager.dat"
 #define MAX_MESSAGE_SIZE 1024 // 最大消息长度
 #define NETWORK_TIMEOUT 1000  // 网络超时时间（毫秒）
+
+// HTTP通信相关定义
+#define CA_PORT 8080       // HTTP服务器端口
+#define HTTP_TIMEOUT 10L     // HTTP请求超时时间（秒）
+
+// 存储服务器IP地址的全局变量
+static char CA_IP[16] = "127.0.0.1";
 
 // 存储相关信息的全局变量
 ImpCert loaded_cert;
@@ -28,22 +35,116 @@ int has_cert = 0;
 int init_crl_manager();
 int load_crl_manager_to_hashmap();
 int check_cert_in_local_crl(const unsigned char *cert_hash);
-int sync_crl_with_ca(int sock);
-int online_csp(int sock, const unsigned char *cert_hash);
+int sync_crl_with_ca();
+int online_csp(const unsigned char *cert_hash);
 int local_csp(const unsigned char *cert_hash);
 
 // 用户操作
 int load_keys_and_cert(const char *user_id);
-int request_registration(int sock, const char *user_id);
-int request_cert_update(int sock, const char *user_id);
-int request_cert_revoke(int sock, const char *user_id);
-int send_signed_message(int sock, const char *user_id, const char *message);
+int request_registration(const char *user_id);
+int request_cert_update(const char *user_id);
+int request_cert_revoke(const char *user_id);
+int send_signed_message(const char *user_id, const char *message);
+
+// HTTP通信相关函数
+typedef struct {
+    unsigned char *data;
+    size_t size;
+} MemoryStruct;
+
+static size_t WriteMemoryCallback(void *contents, size_t size, size_t nmemb, void *userp) {
+    size_t realsize = size * nmemb;
+    MemoryStruct *mem = (MemoryStruct *)userp;
+    
+    mem->data = realloc(mem->data, mem->size + realsize);
+    if (mem->data == NULL) {
+        printf("内存分配失败\n");
+        return 0;
+    }
+    
+    memcpy(&(mem->data[mem->size]), contents, realsize);
+    mem->size += realsize;
+    
+    return realsize;
+}
+
+// 使用HTTP发送请求（用于替代socket通信）
+int http_send_request(const char *url, const unsigned char *data, int data_len, 
+                     unsigned char **response, int *response_len) {
+    CURL *curl;
+    CURLcode res;
+    MemoryStruct chunk;
+    chunk.data = NULL;
+    chunk.size = 0;
+    
+    // 初始化libcurl
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+    curl = curl_easy_init();
+    if (!curl) {
+        printf("初始化curl失败\n");
+        curl_global_cleanup();
+        return 0;
+    }
+    
+    // 设置URL
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    
+    // 设置HTTP POST
+    curl_easy_setopt(curl, CURLOPT_POST, 1L);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, data);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, data_len);
+    
+    // 设置响应数据回调
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteMemoryCallback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&chunk);
+    
+    // 设置超时
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, HTTP_TIMEOUT);
+    
+    // 设置内容类型
+    struct curl_slist *headers = NULL;
+    headers = curl_slist_append(headers, "Content-Type: application/octet-stream");
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    
+    // 执行请求
+    res = curl_easy_perform(curl);
+    if (res != CURLE_OK) {
+        printf("curl_easy_perform() 失败: %s\n", curl_easy_strerror(res));
+        curl_easy_cleanup(curl);
+        curl_slist_free_all(headers);
+        curl_global_cleanup();
+        if (chunk.data) free(chunk.data);
+        return 0;
+    }
+    
+    // 检查HTTP响应状态码
+    long http_code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+    if (http_code != 200) {
+        printf("HTTP错误: %ld\n", http_code);
+        curl_easy_cleanup(curl);
+        curl_slist_free_all(headers);
+        curl_global_cleanup();
+        if (chunk.data) free(chunk.data);
+        return 0;
+    }
+    
+    // 返回响应数据
+    *response = chunk.data;
+    *response_len = chunk.size;
+    
+    // 清理
+    curl_easy_cleanup(curl);
+    curl_slist_free_all(headers);
+    curl_global_cleanup();
+    
+    return 1;
+}
 
 int main() {
     char server_ip[16] = {0};
     char user_id[SUBJECT_ID_SIZE] = {0};
     int choice = 0;
-    int sock = -1;
     int running = 1; // 控制主循环
     int result = 0;
     struct timeval start_time, end_time;
@@ -75,6 +176,9 @@ int main() {
         printf("使用默认IP地址: %s\n", server_ip);
     }
     
+    // 保存IP地址到全局变量
+    strcpy(CA_IP, server_ip);
+    
     // 外层循环 - 处理不同用户
     while (running) {
         // 重置变量
@@ -100,11 +204,12 @@ int main() {
             printf("1. 注册新证书\n");
             printf("2. 更新现有证书\n");
             printf("3. 发送签名消息\n");
-            printf("4. 证书状态查询\n");
-            printf("5. 撤销证书\n");
-            printf("6. 同步CRL\n");
+            printf("4. 撤销证书\n");
+            printf("5. 同步CRL\n");
+            printf("6. 证书状态查询\n");
             printf("7. 证书状态比对(在线+本地)\n");
             printf("8. 切换用户\n");
+            printf("9. 退出程序\n");
 
             printf("请输入选择: ");
             if (scanf("%d", &choice) != 1) {
@@ -113,37 +218,43 @@ int main() {
                 continue;
             }
             
-            // 检查是否要切换用户
+            // 检查是否要切换用户或退出
             if (choice == 8) {
                 user_session = 0; // 退出当前用户会话，返回到用户ID输入
                 continue;
-            }
-            
-            // 连接到服务器
-            sock = connect_to_server(server_ip, PORT);
-            if (sock < 0) {
-                printf("无法连接到服务器 %s，请检查网络或服务器状态\n", server_ip);
+            } else if (choice == 9) {
+                user_session = 0;
+                running = 0; // 退出程序
                 continue;
             }
+            
             result = 0;
             switch (choice) {
-                case 1:
+                case 1: // 注册
                     gettimeofday(&start_time, NULL); // 记录开始时间
-                    result = request_registration(sock, user_id);
+                    result = request_registration(user_id);
+                    if (result) {
+                        // 操作完成后重新加载证书
+                        has_cert = load_keys_and_cert(user_id);
+                    }
                     break;
-                case 2:
+                    
+                case 2: // 更新
                     if (!has_cert) {
                         printf("错误：需要先有证书才能更新\n");
-                        close(sock);
                         continue;
                     }
                     gettimeofday(&start_time, NULL); // 记录开始时间
-                    result = request_cert_update(sock, user_id);
+                    result = request_cert_update(user_id);
+                    if (result) {
+                        // 更新后重新加载证书
+                        has_cert = load_keys_and_cert(user_id);
+                    }
                     break;
-                case 3:
+                    
+                case 3: // 发送消息
                     if (!has_cert) {
                         printf("错误：需要先有证书才能发送消息\n");
-                        close(sock);
                         continue;
                     }
                     clear_input_buffer();
@@ -153,7 +264,6 @@ int main() {
                     printf("请输入要发送的消息: ");
                     if (fgets(message, MAX_MESSAGE_SIZE, stdin) == NULL) {
                         printf("消息输入错误\n");
-                        close(sock);
                         continue;
                     }
                     
@@ -165,98 +275,82 @@ int main() {
                     
                     // 在用户完成输入后再开始计时
                     gettimeofday(&start_time, NULL); // 记录开始时间
-                    result = send_signed_message(sock, user_id, message);
+                    result = send_signed_message(user_id, message);
                     break;
-                case 4:
-                    {
-                        // 处理证书状态查询
-                        unsigned char cert_hash[CERT_HASH_SIZE];
-                        clear_input_buffer();
-                        printf("请输入证书哈希值: ");
-                        if (!parse_hex_hash(cert_hash, CERT_HASH_SIZE)) {
-                            printf("证书哈希输入错误\n");
-                            close(sock);
-                            continue;
-                        }
-                        result = 1;
-                        gettimeofday(&start_time, NULL); // 记录开始时间
-                        int online_status = online_csp(sock, cert_hash);
-                        printf("online_csp:%s\n", online_status ? "有效" : "无效（已撤销）");
-                    }
-                    break;
-                case 5:
+                    
+                case 4: // 撤销证书
                     if (!has_cert) {
                         printf("错误：需要先有证书才能撤销\n");
-                        close(sock);
                         continue;
                     }
                     gettimeofday(&start_time, NULL); // 记录开始时间
-                    result = request_cert_revoke(sock, user_id);
+                    result = request_cert_revoke(user_id);
                     if (result) {
                         has_cert = 0; // 撤销成功后，清除本地证书状态
                     }
                     break;
-                case 6:
+                    
+                case 5: // 同步CRL
                     gettimeofday(&start_time, NULL); // 记录开始时间
-                    result = sync_crl_with_ca(sock);
+                    result = sync_crl_with_ca();
                     break;
-                case 7:
+                    
+                case 6: // 证书状态查询
                     {
-                        unsigned char cert_hash[CERT_HASH_SIZE];
-                        clear_input_buffer();
-                        
-                        if (!parse_hex_hash(cert_hash, CERT_HASH_SIZE)) {
-                            printf("证书哈希输入错误\n");
-                            close(sock);
-                            continue;
-                        }
-                        
-                        gettimeofday(&start_time, NULL);
-                        
-                        int online_status = online_csp(sock, cert_hash);
-                        if (online_status >= 0) {
-                            printf("online_csp:%s\n", online_status ? "有效" : "无效（已撤销）");
-                        } else {
-                            printf("online_csp: 查询失败\n");
-                            close(sock);
-                            continue;
-                        }
-                        
-                        int local_status = local_csp(cert_hash);
-                        printf("local_csp:%s\n", local_status ? "有效" : "无效（已撤销）");
-                        result = 1; // 查询成功
+                    // 处理证书状态查询
+                    unsigned char cert_hash[CERT_HASH_SIZE];
+                    clear_input_buffer();
+                    printf("请输入证书哈希值: ");
+                    if (!parse_hex_hash(cert_hash, CERT_HASH_SIZE)) {
+                        printf("证书哈希输入错误\n");
+                        continue;
                     }
+                    gettimeofday(&start_time, NULL); // 记录开始时间
+                    int online_status = online_csp(cert_hash);
+                    printf("online_csp:%s\n", online_status ? "有效" : "无效（已撤销）");
+                    result = 1;
                     break;
+                    }
+                    
+                case 7: // 证书状态比对
+                    {
+                    unsigned char cert_hash2[CERT_HASH_SIZE];
+                    clear_input_buffer();
+                    
+                    if (!parse_hex_hash(cert_hash2, CERT_HASH_SIZE)) {
+                        printf("证书哈希输入错误\n");
+                        continue;
+                    }
+                    
+                    gettimeofday(&start_time, NULL);
+                    
+                    int online_status2 = online_csp(cert_hash2);
+                    printf("online_csp:%s\n", online_status2 ? "有效" : "无效（已撤销）");
+                    
+                    int local_status = local_csp(cert_hash2);
+                    printf("local_csp:%s\n", local_status ? "有效" : "无效（已撤销）");
+                    result = 1;
+                    break;
+                    }
+                    
                 default:
                     printf("无效的选择\n");
-                    result = 0;
                     break;
             }
-            close(sock);
+            
             if (result) {
                 gettimeofday(&end_time, NULL);
                 long seconds = end_time.tv_sec - start_time.tv_sec;
                 long microseconds = end_time.tv_usec - start_time.tv_usec;
                 double elapsed_ms = seconds * 1000.0 + microseconds / 1000.0;
                 
-                if (choice == 1) {
-                    printf("注册证书的时间开销: %.2f ms\n", elapsed_ms);
-                    // 操作完成后重新加载证书
-                    has_cert = load_keys_and_cert(user_id);
-                } else if (choice == 2) {
-                    printf("更新证书的时间开销: %.2f ms\n", elapsed_ms);
-                    // 更新后重新加载证书
-                    has_cert = load_keys_and_cert(user_id);
-                } else if (choice == 3) {
-                    printf("发送消息的时间开销: %.2f ms\n", elapsed_ms);
-                } else if (choice == 4) {
-                    printf("查询证书状态的时间开销: %.2f ms\n", elapsed_ms);
-                } else if (choice == 5) {
-                    printf("撤销证书的时间开销: %.2f ms\n", elapsed_ms);
-                } else if (choice == 6) {
-                    printf("同步证书撤销列表的时间开销: %.2f ms\n", elapsed_ms);
-                } else if (choice == 7) {
-                    printf("证书状态比对的时间开销: %.2f ms\n", elapsed_ms);
+                const char* operation_names[] = {
+                    "未知操作", "注册证书", "更新证书", "发送消息", 
+                    "撤销证书", "同步证书撤销列表", "查询证书状态", "证书状态比对"
+                };
+                
+                if (choice >= 1 && choice <= 7) {
+                    printf("%s的时间开销: %.2f ms\n", operation_names[choice], elapsed_ms);
                 }
             }
         }
@@ -303,8 +397,6 @@ int load_keys_and_cert(const char *user_id) {
     }
     fclose(cert_file);
     
-    //print_cert_info(&loaded_cert);
-    
     // 加载私钥
     FILE *priv_file = fopen(priv_key_filename, "rb");
     if (!priv_file) {
@@ -337,8 +429,7 @@ int load_keys_and_cert(const char *user_id) {
 }
 
 //----------------用户证书操作函数实现-------------------
-int request_registration(int sock, const char *user_id) {
-    unsigned char buffer[BUFFER_SIZE] = {0};
+int request_registration(const char *user_id) {
     BIGNUM *Ku = NULL;
     EC_POINT *Ru = NULL;
     EC_POINT *Pu = NULL;
@@ -366,33 +457,31 @@ int request_registration(int sock, const char *user_id) {
     memcpy(send_data, user_id, SUBJECT_ID_LEN);
     memcpy(send_data + SUBJECT_ID_LEN, Ru_bytes, ru_len);
     
-    // 发送ID和Ru给CA
-    if (!send_message(sock, CMD_SEND_ID_AND_RU, send_data, SUBJECT_ID_LEN + ru_len)) {
-        printf("发送ID和临时公钥失败\n");
+    // 使用HTTP发送数据
+    unsigned char *response_data = NULL;
+    int response_len = 0;
+    
+    // 构建URL
+    char url[100];
+    sprintf(url, "http://%s:%d/register", CA_IP, CA_PORT);
+    if (!http_send_request(url, send_data, SUBJECT_ID_LEN + ru_len, &response_data, &response_len)) {
+        printf("发送注册请求失败\n");
         goto cleanup;
     }
     
-    // 接收CA发送的证书和部分私钥r
-    uint8_t cmd;
-    int data_len = recv_message(sock, &cmd, buffer, BUFFER_SIZE);
-    if (data_len < 0) {
-        printf("接收数据失败\n");
+    // 验证响应数据
+    if (response_len != sizeof(ImpCert) + SM2_PRI_MAX_SIZE) {
+        printf("接收到的数据长度错误: %d\n", response_len);
+        free(response_data);
         goto cleanup;
     }
-    // 验证命令类型
-    if (cmd != CMD_SEND_CERT_AND_R) {
-        printf("接收到错误的命令类型: %d\n", cmd);
-        goto cleanup;
-    }
+    
     // 解析证书和部分私钥r
     ImpCert cert;
     unsigned char r[SM2_PRI_MAX_SIZE];
-    if (data_len != sizeof(ImpCert) + SM2_PRI_MAX_SIZE) {
-        printf("接收到的数据长度错误: %d\n", data_len);
-        goto cleanup;
-    }
-    memcpy(&cert, buffer, sizeof(ImpCert));
-    memcpy(r, buffer + sizeof(ImpCert), SM2_PRI_MAX_SIZE);
+    memcpy(&cert, response_data, sizeof(ImpCert));
+    memcpy(r, response_data + sizeof(ImpCert), SM2_PRI_MAX_SIZE);
+    free(response_data);
 
     // 准备文件名
     char pub_key_filename[SUBJECT_ID_SIZE + 10] = {0}; // ID + "_pub.key"
@@ -473,8 +562,7 @@ cleanup:
     return ret;
 }
 
-int request_cert_update(int sock, const char *user_id) {
-    unsigned char buffer[BUFFER_SIZE] = {0};
+int request_cert_update(const char *user_id) {
     BIGNUM *Ku = NULL;
     EC_POINT *Ru = NULL;
     EC_POINT *Pu = NULL;
@@ -514,36 +602,31 @@ int request_cert_update(int sock, const char *user_id) {
     memcpy(send_data, sign_data, SUBJECT_ID_LEN + ru_len);
     memcpy(send_data + SUBJECT_ID_LEN + ru_len, signature, 64);
     
-    // 发送更新请求给CA
-    if (!send_message(sock, CMD_REQUEST_UPDATE, send_data, SUBJECT_ID_LEN + ru_len + 64)) {
+    // 使用HTTP发送更新请求
+    unsigned char *response_data = NULL;
+    int response_len = 0;
+    
+    // 构建URL
+    char url[100];
+    sprintf(url, "http://%s:%d/update", CA_IP, CA_PORT);
+    if (!http_send_request(url, send_data, SUBJECT_ID_LEN + ru_len + 64, &response_data, &response_len)) {
         printf("发送更新请求失败\n");
         goto cleanup;
     }
     
-    // 接收CA发送的新证书和部分私钥r
-    uint8_t cmd;
-    int data_len = recv_message(sock, &cmd, buffer, BUFFER_SIZE);
-    if (data_len < 0) {
-        printf("接收数据失败\n");
-        goto cleanup;
-    }
-    
-    // 验证命令类型
-    if (cmd != CMD_SEND_UPDATED_CERT) {
-        printf("接收到错误的命令类型: %d\n", cmd);
+    // 验证响应数据
+    if (response_len != sizeof(ImpCert) + SM2_PRI_MAX_SIZE) {
+        printf("接收到的数据长度错误: %d\n", response_len);
+        free(response_data);
         goto cleanup;
     }
     
     // 解析新证书和部分私钥r
     ImpCert new_cert;
     unsigned char r[SM2_PRI_MAX_SIZE];
-    if (data_len != sizeof(ImpCert) + SM2_PRI_MAX_SIZE) {
-        printf("接收到的数据长度错误: %d\n", data_len);
-        goto cleanup;
-    }
-    memcpy(&new_cert, buffer, sizeof(ImpCert));
-    memcpy(r, buffer + sizeof(ImpCert), SM2_PRI_MAX_SIZE);
-    print_hex("新部分私钥r", r, SM2_PRI_MAX_SIZE);
+    memcpy(&new_cert, response_data, sizeof(ImpCert));
+    memcpy(r, response_data + sizeof(ImpCert), SM2_PRI_MAX_SIZE);
+    free(response_data);
     
     // 保存新证书供后续使用
     char cert_filename[SUBJECT_ID_SIZE + 5] = {0}; // ID + ".crt"
@@ -621,7 +704,7 @@ cleanup:
     return ret;
 }
 
-int send_signed_message(int sock, const char *user_id, const char *message) {
+int send_signed_message(const char *user_id, const char *message) {
     // 检查消息长度
     int message_len = strlen(message);
     if (message_len > MAX_MESSAGE_SIZE) {
@@ -663,19 +746,30 @@ int send_signed_message(int sock, const char *user_id, const char *message) {
     // 填充证书
     memcpy(send_data + 2 + message_len + 64, &loaded_cert, sizeof(ImpCert));
     
-    // 发送数据
-    int result = send_message(sock, CMD_SEND_MESSAGE, send_data, data_size);
+    // 使用HTTP发送数据
+    unsigned char *response_data = NULL;
+    int response_len = 0;
+    
+    // 构建URL
+    char url[100];
+    sprintf(url, "http://%s:%d/message", CA_IP, CA_PORT);
+    
+    int result = http_send_request(url, send_data, data_size, &response_data, &response_len);
     free(send_data);
     
     if (result) {
         printf("已成功发送签名消息\n");
+        if (response_data) free(response_data);
         return 1;
     } else {
         printf("发送签名消息失败\n");
+        if (response_data) free(response_data);
         return 0;
     }
 }
-int request_cert_revoke(int sock, const char *user_id) {
+
+// 使用HTTP请求撤销证书
+int request_cert_revoke(const char *user_id) {
     // 检查证书和私钥是否已加载
     if (!has_cert) {
         printf("错误：找不到用户证书\n");
@@ -705,45 +799,41 @@ int request_cert_revoke(int sock, const char *user_id) {
     memcpy(request_data + SUBJECT_ID_LEN, &ts_network, 8);
     memcpy(request_data + SUBJECT_ID_LEN + 8, signature, 64);
     
-    // 发送撤销请求
-    if (!send_message(sock, CMD_REQUEST_REVOKE, request_data, sizeof(request_data))) {
+    // 使用HTTP发送数据
+    unsigned char *response_data = NULL;
+    int response_len = 0;
+    
+    // 构建URL
+    char url[100];
+    sprintf(url, "http://%s:%d/revoke", CA_IP, CA_PORT);
+    
+    if (!http_send_request(url, request_data, sizeof(request_data), &response_data, &response_len)) {
         printf("发送撤销请求失败\n");
         return 0;
     }
-     
-    // 接收撤销响应
-    unsigned char response[BUFFER_SIZE];
-    uint8_t resp_cmd;
-    int resp_len = recv_message(sock, &resp_cmd, response, BUFFER_SIZE);
     
-    if (resp_len < 0 || resp_cmd != CMD_REVOKE_RESPONSE) {
-        printf("接收撤销响应失败或响应命令错误\n");
-        return 0;
-    }
-    
-    // 检查响应长度
-    if (resp_len < 1 + 8 + 64) {  // 状态 + 时间戳 + 签名
+    // 验证响应数据
+    if (response_len < 1 + 8 + 64) {  // 状态 + 时间戳 + 签名
         printf("撤销响应数据长度错误\n");
+        free(response_data);
         return 0;
     }
     
-    // 解析响应状态
-    uint8_t status = response[0];
+    uint8_t status = response_data[0];
     
-    // 解析时间戳
     uint64_t resp_timestamp;
-    memcpy(&resp_timestamp, response + 1, 8);
+    memcpy(&resp_timestamp, response_data + 1, 8);
     resp_timestamp = be64toh(resp_timestamp);  // 网络字节序转为主机字节序
     
-    // 使用validate_timestamp函数验证时间戳
     if (!validate_timestamp(resp_timestamp)) {
         printf("撤销响应中的时间戳无效\n");
+        free(response_data);
         return 0;
     }
     
     // 获取签名
     unsigned char resp_signature[64];
-    memcpy(resp_signature, response + 1 + 8, 64);
+    memcpy(resp_signature, response_data + 1 + 8, 64);
     
     // 验证签名
     unsigned char resp_sign_data[1 + 8];
@@ -753,14 +843,18 @@ int request_cert_revoke(int sock, const char *user_id) {
     
     if (!sm2_verify(resp_signature, resp_sign_data, 1 + 8, Q_ca)) {
         printf("撤销响应签名验证失败\n");
+        free(response_data);
         return 0;
     }
     
     // 检查状态
     if (status != 1) {
         printf("撤销失败，CA返回状态: %d\n", status);
+        free(response_data);
         return 0;
     }
+    
+    free(response_data);
     
     printf("证书撤销成功！正在清理本地证书文件...\n");
     
@@ -847,57 +941,53 @@ int load_crl_manager_to_hashmap() {
 // 本地检查证书是否在CRL中
 int check_cert_in_local_crl(const unsigned char *cert_hash) {
     if (!local_crl || !cert_hash) return 0;
-    
-    // 使用哈希表快速检查证书哈希是否存在
     return hashmap_exists(local_crl, cert_hash);
 }
 
 // 与CA同步CRL数据
-int sync_crl_with_ca(int sock) {
-
+int sync_crl_with_ca() {
+    // 准备版本信息数据
     int version_info[2];
     version_info[0] = crl_manager->base_v;      // 当前节点基础版本号
     version_info[1] = crl_manager->removed_v;   // 当前已删除节点版本号
     
-    printf("current_v:(%d,%d)\n",version_info[0],version_info[1]);
+    printf("current_v:(%d,%d)\n", version_info[0], version_info[1]);
     
-    if (!send_message(sock, CMD_REQUEST_CRL_UPDATE, version_info, sizeof(version_info))) {
+    // 使用HTTP发送数据
+    unsigned char *response_data = NULL;
+    int response_len = 0;
+    
+    // 构建URL
+    char url[100];
+    sprintf(url, "http://%s:%d/crl_update", CA_IP, CA_PORT);
+    
+    if (!http_send_request(url, (unsigned char*)version_info, sizeof(version_info), 
+                          &response_data, &response_len)) {
         printf("发送CRL同步请求失败\n");
         return 0;
     }
     
-    unsigned char buffer[BUFFER_SIZE] = {0};
-    uint8_t cmd;
-    int data_len = recv_message(sock, &cmd, buffer, BUFFER_SIZE);
-    
-    if (data_len < 0) {
-        printf("接收CRL更新数据失败\n");
-        return 0;
-    }
-    
-    if (cmd != CMD_SEND_CRL_UPDATE) {
-        printf("接收到错误的命令类型: %d\n", cmd);
-        return 0;
-    }
-    
-    if (data_len == 0) {
+    // 处理响应，如果长度为1并且值为1表示当前CRL已经是最新的
+    if (response_len == 1 && response_data && response_data[0] == 1) {
         printf("当前CRL已是最新版本\n");
+        free(response_data);
         return 1;
     }
     
     // 检查数据长度是否至少包含时间戳(8字节)和签名(64字节)
-    if (data_len <= 8 + 64) {
+    if (response_len <= 8 + 64) {
         printf("接收到的CRL更新数据长度错误\n");
+        free(response_data);
         return 0;
     }
     
     // 提取时间戳和签名
-    int crl_data_len = data_len - 8 - 64;
+    int crl_data_len = response_len - 8 - 64;
     uint64_t timestamp;
     unsigned char signature[64];
     
-    memcpy(&timestamp, buffer + crl_data_len, 8);
-    memcpy(signature, buffer + crl_data_len + 8, 64);
+    memcpy(&timestamp, response_data + crl_data_len, 8);
+    memcpy(signature, response_data + crl_data_len + 8, 64);
     
     // 将时间戳从网络字节序转换为主机字节序
     timestamp = be64toh(timestamp);
@@ -905,6 +995,7 @@ int sync_crl_with_ca(int sock) {
     // 验证时间戳是否有效
     if (!validate_timestamp(timestamp)) {
         printf("CRL更新中的时间戳无效\n");
+        free(response_data);
         return 0;
     }
     
@@ -912,10 +1003,11 @@ int sync_crl_with_ca(int sock) {
     unsigned char *verify_data = malloc(crl_data_len + 8);
     if (!verify_data) {
         printf("内存分配失败\n");
+        free(response_data);
         return 0;
     }
     
-    memcpy(verify_data, buffer, crl_data_len);
+    memcpy(verify_data, response_data, crl_data_len);
     // 时间戳使用网络字节序
     uint64_t ts_network = htobe64(timestamp);
     memcpy(verify_data + crl_data_len, &ts_network, 8);
@@ -924,6 +1016,7 @@ int sync_crl_with_ca(int sock) {
     if (!sm2_verify(signature, verify_data, crl_data_len + 8, Q_ca)) {
         printf("CA签名验证失败！此CRL更新可能不是来自合法CA\n");
         free(verify_data);
+        free(response_data);
         return 0;
     }
     
@@ -931,9 +1024,10 @@ int sync_crl_with_ca(int sock) {
     printf("CRL更新数据的签名验证成功\n");
     
     // 反序列化更新数据
-    UpdatedCRL* updated_crl = CRLManager_deserialize_update(buffer, crl_data_len);
+    UpdatedCRL* updated_crl = CRLManager_deserialize_update(response_data, crl_data_len);
     if (!updated_crl) {
         printf("解析CRL更新数据失败\n");
+        free(response_data);
         return 0;
     }
     
@@ -944,9 +1038,11 @@ int sync_crl_with_ca(int sock) {
     if (!CRLManager_apply_update(crl_manager, updated_crl, local_crl)) {
         printf("应用CRL更新失败\n");
         CRLManager_free_update(updated_crl);
+        free(response_data);
         return 0;
     }
     CRLManager_free_update(updated_crl);
+    free(response_data);
     
     // 保存更新后的CRL管理器
     if (!CRLManager_save_to_file(crl_manager, CRL_MANAGER_FILE)) {
@@ -954,7 +1050,7 @@ int sync_crl_with_ca(int sock) {
         return 0;
     }
     
-    printf("current_v:(%d,%d)\n",crl_manager->base_v,crl_manager->removed_v);
+    printf("current_v:(%d,%d)\n", crl_manager->base_v, crl_manager->removed_v);
     
     return 1;
 }
@@ -965,58 +1061,37 @@ int local_csp(const unsigned char *cert_hash) {
 }
 
 // 证书状态查询函数 - 先尝试在线查询，超时则使用本地查询
-int online_csp(int sock, const unsigned char *cert_hash) {
-    unsigned char buffer[BUFFER_SIZE] = {0};
-    int local_status = 0;
-    // 设置套接字接收超时
-    struct timeval timeout;
-    timeout.tv_sec = NETWORK_TIMEOUT / 1000;
-    timeout.tv_usec = (NETWORK_TIMEOUT % 1000) * 1000;
+int online_csp(const unsigned char *cert_hash) {
+    unsigned char *response_data = NULL;
+    int response_len = 0;
     
-    if (setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0) {
-        printf("设置套接字超时失败，使用本地查询\n");
-        goto use_local;
-    }
+    // 构建URL
+    char url[100];
+    sprintf(url, "http://%s:%d/cert_status", CA_IP, CA_PORT);
     
     // 发送证书哈希值到CA进行验证
-    if (!send_message(sock, CMD_VERIFY_CERT, cert_hash, CERT_HASH_SIZE)) {
-        printf("发送证书验证请求失败\n");
-        goto use_local;
-    }
-    
-    // 接收CA的响应，如果超时会自动返回错误
-    uint8_t cmd;
-    int data_len = recv_message(sock, &cmd, buffer, BUFFER_SIZE);
-    
-    if (data_len < 0) {
-        printf("接收数据超时或失败，使用本地查询\n");
-        goto use_local;
-    }
-    
-    // 验证命令类型
-    if (cmd != CMD_CERT_STATUS) {
-        printf("接收到错误的命令类型: %d，使用本地查询\n", cmd);
-        goto use_local;
+    if (!http_send_request(url, cert_hash, CERT_HASH_SIZE, &response_data, &response_len)) {
+        printf("发送证书验证请求失败，使用本地查询\n");
+        return local_csp(cert_hash);
     }
     
     // 解析响应数据：状态(1字节) + 时间戳(8字节) + 签名(64字节)
-    if (data_len != 1 + 8 + 64) {
-        printf("接收到的数据长度错误: %d，使用本地查询\n", data_len);
-        goto use_local;
+    if (response_len != 1 + 8 + 64) {
+        printf("接收到的数据长度错误: %d，使用本地查询\n", response_len);
+        free(response_data);
+        return local_csp(cert_hash);
     }
     
     // 提取状态和时间戳
-    uint8_t status = buffer[0];
+    uint8_t status = response_data[0];
     uint64_t timestamp;
-    memcpy(&timestamp, buffer + 1, 8);
-    
-    // 转换为主机字节序
+    memcpy(&timestamp, response_data + 1, 8);
     timestamp = be64toh(timestamp);
     
-    // 使用validate_timestamp函数验证时间戳
     if (!validate_timestamp(timestamp)) {
         printf("证书状态响应中的时间戳无效，使用本地查询\n");
-        goto use_local;
+        free(response_data);
+        return local_csp(cert_hash);
     }
     
     // 验证CA签名
@@ -1027,22 +1102,17 @@ int online_csp(int sock, const unsigned char *cert_hash) {
     uint64_t ts_network = htobe64(timestamp);
     memcpy(signed_data + CERT_HASH_SIZE + 1, &ts_network, 8);
     
-    // 提取签名
     unsigned char signature[64];
-    memcpy(signature, buffer + 1 + 8, 64);
+    memcpy(signature, response_data + 1 + 8, 64);
     
-    // 用CA公钥验证签名
     if (!sm2_verify(signature, signed_data, CERT_HASH_SIZE + 1 + 8, Q_ca)) {
         printf("CA签名验证失败！此响应可能不是来自合法CA，使用本地查询\n");
-        goto use_local;
+        free(response_data);
+        return local_csp(cert_hash);
     }
     
-    printf("在线查询结果: 证书%s\n", status ? "有效" : "无效（已撤销）");
-    return status;
-    
-use_local:
-    // 使用本地CRL查询证书状态
-    local_status = local_csp(cert_hash);
-    printf("本地查询结果: 证书%s\n", local_status ? "有效" : "无效（已撤销）");
-    return local_status;
+    // 返回证书状态
+    int cert_status = status;
+    free(response_data);
+    return cert_status;
 }

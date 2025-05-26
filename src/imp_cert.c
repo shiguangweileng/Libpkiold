@@ -1,6 +1,9 @@
 #include "imp_cert.h"
 #include <string.h>
 #include <stdio.h>
+#include <openssl/asn1.h>
+#include <openssl/asn1t.h>
+#include <errno.h>
 
 /**
  * 将公钥点保存到证书中（内部辅助函数）
@@ -127,27 +130,102 @@ int validate_cert(const ImpCert *cert)
     return (current_time >= start_time && current_time <= end_time) ? 1 : 0;
 }
 
+// ASN.1序列化规则
+ASN1_SEQUENCE(ImpCertAsn1) = {
+    ASN1_SIMPLE(ImpCertAsn1, serialNum, ASN1_UTF8STRING),
+    ASN1_SIMPLE(ImpCertAsn1, issuerID, ASN1_UTF8STRING),
+    ASN1_SIMPLE(ImpCertAsn1, subjectID, ASN1_UTF8STRING),
+    ASN1_SIMPLE(ImpCertAsn1, startTime, ASN1_INTEGER),
+    ASN1_SIMPLE(ImpCertAsn1, endTime, ASN1_INTEGER),
+    ASN1_SIMPLE(ImpCertAsn1, pubKey, ASN1_OCTET_STRING)
+} ASN1_SEQUENCE_END(ImpCertAsn1)
+
+// 实现ASN.1函数
+IMPLEMENT_ASN1_FUNCTIONS(ImpCertAsn1)
+
 int save_cert(const ImpCert *cert, const char *filename)
 {
     // 参数检查
     if (cert == NULL || filename == NULL) {
+        fprintf(stderr, "保存证书失败: 无效的参数\n");
         return 0;
     }
     
-    // 打开文件
+    // 创建ASN.1结构
+    ImpCertAsn1 *asn1_cert = ImpCertAsn1_new();
+    if (!asn1_cert) {
+        return 0;
+    }
+    
+    // 填充ASN.1结构
+    time_t start_time, end_time;
+    int ret = 0;
+    
+    // 提取时间戳
+    memcpy(&start_time, cert->Validity, sizeof(time_t));
+    memcpy(&end_time, cert->Validity + sizeof(time_t), sizeof(time_t));
+    
+    // 设置字符串字段
+    asn1_cert->serialNum = ASN1_UTF8STRING_new();
+    asn1_cert->issuerID = ASN1_UTF8STRING_new();
+    asn1_cert->subjectID = ASN1_UTF8STRING_new();
+    
+    if (!asn1_cert->serialNum || !asn1_cert->issuerID || !asn1_cert->subjectID ||
+        !ASN1_STRING_set(asn1_cert->serialNum, cert->SerialNum, strlen((char*)cert->SerialNum)) ||
+        !ASN1_STRING_set(asn1_cert->issuerID, cert->IssuerID, strlen((char*)cert->IssuerID)) ||
+        !ASN1_STRING_set(asn1_cert->subjectID, cert->SubjectID, strlen((char*)cert->SubjectID))) {
+        goto cleanup;
+    }
+    
+    // 设置时间字段
+    asn1_cert->startTime = ASN1_INTEGER_new();
+    asn1_cert->endTime = ASN1_INTEGER_new();
+    if (!asn1_cert->startTime || !asn1_cert->endTime || 
+        !ASN1_INTEGER_set_int64(asn1_cert->startTime, start_time) ||
+        !ASN1_INTEGER_set_int64(asn1_cert->endTime, end_time)) {
+        goto cleanup;
+    }
+    
+    // 设置公钥
+    asn1_cert->pubKey = ASN1_OCTET_STRING_new();
+    if (!asn1_cert->pubKey || 
+        !ASN1_OCTET_STRING_set(asn1_cert->pubKey, cert->PubKey, sizeof(cert->PubKey))) {
+        goto cleanup;
+    }
+    
+    // DER编码
+    unsigned char *der_data = NULL;
+    int der_len = i2d_ImpCertAsn1(asn1_cert, &der_data);
+    if (der_len <= 0 || !der_data) {
+        goto cleanup;
+    }
+    
+    // 写入文件
     FILE *fp = fopen(filename, "wb");
-    if (fp == NULL) {
-        return 0;
+    if (!fp) {
+        fprintf(stderr, "保存证书失败: 无法打开文件 %s: %s\n", 
+                filename, strerror(errno));
+        OPENSSL_free(der_data);
+        goto cleanup;
     }
     
-    // 写入证书数据
-    int written = fwrite(cert, sizeof(ImpCert), 1, fp);
+    size_t written = fwrite(der_data, 1, der_len, fp);
+    if (written != der_len) {
+        fprintf(stderr, "保存证书失败: 文件写入错误: %s\n", strerror(errno));
+        fclose(fp);
+        OPENSSL_free(der_data);
+        goto cleanup;
+    }
     
-    // 关闭文件
+    ret = 1;  // 成功标志
     fclose(fp);
-    
-    return (written == 1) ? 1 : 0;
+    OPENSSL_free(der_data);
+
+cleanup:
+    ImpCertAsn1_free(asn1_cert);
+    return ret;
 }
+
 int load_cert(ImpCert *cert, const char *filename)
 {
     // 参数检查
@@ -155,19 +233,92 @@ int load_cert(ImpCert *cert, const char *filename)
         return 0;
     }
     
-    // 打开文件
+    // 读取DER编码文件
     FILE *fp = fopen(filename, "rb");
-    if (fp == NULL) {
+    if (!fp) {
+        fprintf(stderr, "加载证书失败: 无法打开文件 %s: %s\n", 
+                filename, strerror(errno));
         return 0;
     }
     
-    // 读取证书数据
-    int read = fread(cert, sizeof(ImpCert), 1, fp);
+    // 获取文件大小
+    fseek(fp, 0, SEEK_END);
+    long file_size = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
     
-    // 关闭文件
+    if (file_size <= 0) {
+        fclose(fp);
+        return 0;
+    }
+    
+    // 分配内存
+    unsigned char *der_data = (unsigned char*)malloc(file_size);
+    if (!der_data) {
+        fprintf(stderr, "加载证书失败: 内存分配错误\n");
+        fclose(fp);
+        return 0;
+    }
+    
+    // 读取DER数据
+    size_t read_size = fread(der_data, 1, file_size, fp);
     fclose(fp);
     
-    return (read == 1) ? 1 : 0;
+    if (read_size != file_size) {
+        fprintf(stderr, "加载证书失败: 文件读取错误: %s\n", strerror(errno));
+        free(der_data);
+        return 0;
+    }
+    
+    // 解码DER数据
+    const unsigned char *p = der_data;
+    ImpCertAsn1 *asn1_cert = d2i_ImpCertAsn1(NULL, &p, file_size);
+    free(der_data);
+    
+    if (!asn1_cert) {
+        fprintf(stderr, "加载证书失败: DER解码失败\n");
+        return 0;
+    }
+    
+    // 清空证书结构
+    memset(cert, 0, sizeof(ImpCert));
+    
+    // 复制字符串字段
+    if (asn1_cert->serialNum && ASN1_STRING_length(asn1_cert->serialNum) > 0) {
+        strncpy((char*)cert->SerialNum, (char*)ASN1_STRING_get0_data(asn1_cert->serialNum), 
+                sizeof(cert->SerialNum) - 1);
+    }
+    
+    if (asn1_cert->issuerID && ASN1_STRING_length(asn1_cert->issuerID) > 0) {
+        strncpy((char*)cert->IssuerID, (char*)ASN1_STRING_get0_data(asn1_cert->issuerID), 
+                sizeof(cert->IssuerID) - 1);
+    }
+    
+    if (asn1_cert->subjectID && ASN1_STRING_length(asn1_cert->subjectID) > 0) {
+        strncpy((char*)cert->SubjectID, (char*)ASN1_STRING_get0_data(asn1_cert->subjectID), 
+                sizeof(cert->SubjectID) - 1);
+    }
+    
+    // 复制时间字段
+    time_t start_time = 0, end_time = 0;
+    
+    if (asn1_cert->startTime) {
+        ASN1_INTEGER_get_int64(&start_time, asn1_cert->startTime);
+    }
+    
+    if (asn1_cert->endTime) {
+        ASN1_INTEGER_get_int64(&end_time, asn1_cert->endTime);
+    }
+    
+    memcpy(cert->Validity, &start_time, sizeof(time_t));
+    memcpy(cert->Validity + sizeof(time_t), &end_time, sizeof(time_t));
+    
+    // 复制公钥
+    if (asn1_cert->pubKey && ASN1_STRING_length(asn1_cert->pubKey) == sizeof(cert->PubKey)) {
+        memcpy(cert->PubKey, ASN1_STRING_get0_data(asn1_cert->pubKey), sizeof(cert->PubKey));
+    }
+    
+    ImpCertAsn1_free(asn1_cert);
+    return 1;
 }
 
 void print_cert_info(const ImpCert *cert) {

@@ -1,6 +1,19 @@
 server/ca-server/ca
 server/user-client/user
 server/user-client/auto_test
-webmonitor/webmonitor
-ca_web
-webui
+server/user-client/func_test
+**/ca_web
+
+# 用户数据
+U*.crt
+U*_priv.key
+U*_pub.key
+
+# ca数据
+CRL.dat
+CRLManager.dat
+**/SerialNum.txt
+UserList.dat
+
+# 其他
+**/settings.json
