@@ -63,10 +63,12 @@ int handle_keypair_with_param(struct MHD_Connection *connection);
 int handle_sign_message(struct MHD_Connection *connection, const char *upload_data, size_t *upload_data_size);
 int handle_verify_signature(struct MHD_Connection *connection, const char *upload_data, size_t *upload_data_size);
 int handle_revoke_certificate(struct MHD_Connection *connection, const char *upload_data, size_t *upload_data_size);
+int handle_cert_version(struct MHD_Connection *connection);
+int handle_set_cert_version(struct MHD_Connection *connection, const char *upload_data, size_t *upload_data_size);
 // 工具函数
 int hex_decode(const char *hex_str, unsigned char *bin_data, int max_size);
 char* hex_encode(const unsigned char *bin_data, int bin_size);
-// 错误响应函数
+// 响应函数
 int send_error_response(struct MHD_Connection *connection, int status_code, const char *message);
 int send_json_error(struct MHD_Connection *connection, int status_code, const char *message);
 int send_json_response(struct MHD_Connection *connection, int status_code, struct json_object *json_obj, const char *allowed_methods);
@@ -193,7 +195,6 @@ int send_json_error(struct MHD_Connection *connection, int status_code, const ch
     return ret;
 }
 
-// 添加通用的JSON响应函数
 int send_json_response(struct MHD_Connection *connection, int status_code, struct json_object *json_obj, const char *allowed_methods) {
     const char *response_str = json_object_to_json_string(json_obj);
     struct MHD_Response *response = MHD_create_response_from_buffer(
@@ -516,10 +517,10 @@ int handle_local_cert_operation(struct MHD_Connection *connection, const char *u
     user_id = json_object_get_string(user_id_obj);
     
     // 检查用户ID格式
-    if (strlen(user_id) != 8) {
+    if (strlen(user_id) != 4) {
         response_obj = json_object_new_object();
         json_object_object_add(response_obj, "success", json_object_new_boolean(0));
-        json_object_object_add(response_obj, "message", json_object_new_string("用户ID必须是8个字符"));
+        json_object_object_add(response_obj, "message", json_object_new_string("用户ID必须是4个字符"));
         
         int ret = send_json_response(connection, MHD_HTTP_BAD_REQUEST, response_obj, "POST, OPTIONS");
         json_object_put(response_obj);
@@ -890,6 +891,112 @@ int handle_revoke_certificate(struct MHD_Connection *connection, const char *upl
     return ret;
 }
 
+int handle_cert_version(struct MHD_Connection *connection) {
+    unsigned char current_version = CERT_V1; // 默认版本
+    int success = 0;
+
+    pthread_mutex_lock(&ca_socket_mutex);
+    if (ca_socket < 0) {
+        ca_socket = connect_to_server(CA_IP, CA_PORT);
+    }
+    
+    if (ca_socket >= 0) {
+        // 调用获取当前证书版本的函数
+        int version = request_get_cert_version(ca_socket);
+        if (version > 0) {
+            current_version = (unsigned char)version;
+            success = 1;
+        }
+    }
+    pthread_mutex_unlock(&ca_socket_mutex);
+    
+    // 构建响应
+    struct json_object *response_obj = json_object_new_object();
+    json_object_object_add(response_obj, "success", json_object_new_boolean(success));
+    json_object_object_add(response_obj, "version", json_object_new_int(current_version));
+    
+    int ret = send_json_response(connection, success ? MHD_HTTP_OK : MHD_HTTP_SERVICE_UNAVAILABLE, 
+                               response_obj, "GET, OPTIONS");
+    json_object_put(response_obj);
+    
+    return ret;
+}
+
+// 处理设置证书版本请求
+int handle_set_cert_version(struct MHD_Connection *connection, const char *upload_data, size_t *upload_data_size) {
+    static char *request_buffer = NULL;
+    struct json_object *request_obj = NULL;
+    struct json_object *version_obj = NULL;
+    int success = 0;
+    
+    // 解析POST数据
+    request_obj = parse_post_data(connection, &request_buffer, upload_data, upload_data_size);
+    
+    // 如果是第一次调用或者没有POST数据，直接返回
+    if (request_obj == NULL && request_buffer != NULL) {
+        return MHD_YES;
+    }
+    
+    // 没有POST数据或解析失败
+    if (request_obj == NULL) {
+        if (request_buffer) free(request_buffer);
+        request_buffer = NULL;
+        return send_json_error(connection, MHD_HTTP_BAD_REQUEST, "缺少必要的请求数据");
+    }
+    
+    // 获取要设置的版本
+    if (!json_object_object_get_ex(request_obj, "version", &version_obj) ||
+        !json_object_is_type(version_obj, json_type_int)) {
+        
+        json_object_put(request_obj);
+        if (request_buffer) free(request_buffer);
+        request_buffer = NULL;
+        return send_json_error(connection, MHD_HTTP_BAD_REQUEST, "缺少必要的版本字段");
+    }
+    
+    int version = json_object_get_int(version_obj);
+    
+    // 验证版本有效性
+    if (version != CERT_V1 && version != CERT_V2) {
+        json_object_put(request_obj);
+        if (request_buffer) free(request_buffer);
+        request_buffer = NULL;
+        return send_json_error(connection, MHD_HTTP_BAD_REQUEST, "无效的证书版本");
+    }
+    
+    // 发送版本设置请求到CA
+    pthread_mutex_lock(&ca_socket_mutex);
+    if (ca_socket < 0) {
+        ca_socket = connect_to_server(CA_IP, CA_PORT);
+    }
+    
+    if (ca_socket >= 0) {
+        success = request_set_cert_version(ca_socket, (unsigned char)version);
+    }
+    pthread_mutex_unlock(&ca_socket_mutex);
+    
+    // 构建响应
+    struct json_object *response_obj = json_object_new_object();
+    json_object_object_add(response_obj, "success", json_object_new_boolean(success));
+    
+    if (success) {
+        json_object_object_add(response_obj, "message", json_object_new_string("证书版本设置成功"));
+    } else {
+        json_object_object_add(response_obj, "message", json_object_new_string("证书版本设置失败"));
+    }
+    
+    int ret = send_json_response(connection, success ? MHD_HTTP_OK : MHD_HTTP_SERVICE_UNAVAILABLE, 
+                               response_obj, "POST, OPTIONS");
+    
+    json_object_put(response_obj);
+    json_object_put(request_obj);
+    
+    if (request_buffer) free(request_buffer);
+    request_buffer = NULL;
+    
+    return ret;
+}
+
 // HTTP请求处理回调函数
 enum MHD_Result request_handler(void *cls, struct MHD_Connection *connection,
                                 const char *url, const char *method,
@@ -910,6 +1017,8 @@ enum MHD_Result request_handler(void *cls, struct MHD_Connection *connection,
             return handle_keypair_with_param(connection);
         } else if (strcmp(url, "/api/users/certificate") == 0) {
             return handle_user_certificate(connection, url);
+        } else if (strcmp(url, "/api/cert-version") == 0) {
+            return handle_cert_version(connection);
         }
     }
     
@@ -933,6 +1042,8 @@ enum MHD_Result request_handler(void *cls, struct MHD_Connection *connection,
             return handle_verify_signature(connection, upload_data, upload_data_size);
         } else if (strcmp(url, "/api/revoke-certificate") == 0) {
             return handle_revoke_certificate(connection, upload_data, upload_data_size);
+        } else if (strcmp(url, "/api/set-cert-version") == 0) {
+            return handle_set_cert_version(connection, upload_data, upload_data_size);
         }
     }
     

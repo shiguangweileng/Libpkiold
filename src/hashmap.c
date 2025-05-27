@@ -259,8 +259,7 @@ hashmap* ul_hashmap_load(const char* filename) {
     
     // 读取所有条目
     for (int i = 0; i < count; i++) {
-        // 读取键（用户ID，固定8字符）
-        char* key = malloc(SUBJECT_ID_SIZE); // 8字符+结束符
+        char* key = malloc(SUBJECT_ID_SIZE);
         if (!key) break;
         
         if (fread(key, 1, SUBJECT_ID_LEN, file) != SUBJECT_ID_LEN) {

@@ -28,6 +28,10 @@
 #define WEB_CMD_LOCAL_RESULT   0x8B    // ca向ca_web发送本地操作结果
 #define WEB_CMD_REVOKE_CERT    0x8C    // ca_web请求撤销证书
 #define WEB_CMD_REVOKE_RESULT  0x8D    // ca向ca_web发送撤销结果
+#define WEB_CMD_SET_CERT_VERSION 0x30 // Web -> CA: 设置当前使用的证书版本
+#define WEB_CMD_VERSION_RESULT 0x31  // CA -> Web: 设置证书版本结果
+#define WEB_CMD_GET_CERT_VERSION 0x32  // Web -> CA: 获取当前使用的证书版本
+#define WEB_CMD_CERT_VERSION_DATA 0x33  // CA -> Web: 返回当前使用的证书版本
 
 // 基础通信相关函数
 int setup_server(int port);
@@ -50,5 +54,11 @@ int request_local_gen_cert(int ca_socket, const char *user_id);
 int request_local_upd_cert(int ca_socket, const char *user_id);
 
 int request_revoke_cert(int ca_socket, const char *user_id);
+
+// 设置证书版本(CERT_V1或CERT_V2)，返回1表示成功，0表示失败
+int request_set_cert_version(int ca_socket, unsigned char version);
+
+// 获取当前使用的证书版本，返回版本号(1/2)，失败返回0
+int request_get_cert_version(int ca_socket);
 
 #endif // WEB_PROTOCOL_H 

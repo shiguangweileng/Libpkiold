@@ -186,8 +186,8 @@ int main() {
         memset(user_id, 0, SUBJECT_ID_SIZE);
         
         // 请求用户输入ID
-        printf("\n请输入用户ID (必须是8个字符): ");
-        if (scanf("%8s", user_id) != 1) {
+        printf("\n请输入用户ID (必须是4个字符): ");
+        if (scanf("%4s", user_id) != 1) {
             printf("ID输入错误\n");
             clear_input_buffer();
             continue;
@@ -297,10 +297,8 @@ int main() {
                     
                 case 6: // 证书状态查询
                     {
-                    // 处理证书状态查询
                     unsigned char cert_hash[CERT_HASH_SIZE];
                     clear_input_buffer();
-                    printf("请输入证书哈希值: ");
                     if (!parse_hex_hash(cert_hash, CERT_HASH_SIZE)) {
                         printf("证书哈希输入错误\n");
                         continue;
@@ -374,9 +372,9 @@ int main() {
 
 //----------------证书处理函数实现-------------------
 int load_keys_and_cert(const char *user_id) {
-    char cert_filename[SUBJECT_ID_SIZE + 5] = {0}; // ID + ".crt"
-    char priv_key_filename[SUBJECT_ID_SIZE + 11] = {0}; // ID + "_priv.key"
-    char pub_key_filename[SUBJECT_ID_SIZE + 10] = {0}; // ID + "_pub.key"
+    char cert_filename[SUBJECT_ID_LEN + 5] = {0}; // ID + ".crt"
+    char priv_key_filename[SUBJECT_ID_LEN + 10] = {0}; // ID + "_priv.key"
+    char pub_key_filename[SUBJECT_ID_LEN + 9] = {0}; // ID + "_pub.key"
     
     sprintf(cert_filename, "%s.crt", user_id);
     sprintf(priv_key_filename, "%s_priv.key", user_id);
@@ -433,6 +431,7 @@ int request_registration(const char *user_id) {
     BIGNUM *Ku = NULL;
     EC_POINT *Ru = NULL;
     EC_POINT *Pu = NULL;
+    ImpCert cert = {0};
     int ret = 0;
     
     //--------step1:用户端-----------
@@ -453,7 +452,7 @@ int request_registration(const char *user_id) {
                                      Ru_bytes, SM2_PUB_MAX_SIZE, NULL);
     
     // 准备发送数据：ID + Ru（先ID后Ru）
-    unsigned char send_data[SUBJECT_ID_SIZE + SM2_PUB_MAX_SIZE];
+    unsigned char send_data[SUBJECT_ID_LEN + SM2_PUB_MAX_SIZE];
     memcpy(send_data, user_id, SUBJECT_ID_LEN);
     memcpy(send_data + SUBJECT_ID_LEN, Ru_bytes, ru_len);
     
@@ -469,35 +468,42 @@ int request_registration(const char *user_id) {
         goto cleanup;
     }
     
-    // 验证响应数据
-    if (response_len != sizeof(ImpCert) + SM2_PRI_MAX_SIZE) {
+    // 解析证书基本信息
+    unsigned char r[SM2_PRI_MAX_SIZE];
+    
+    // 直接判断响应长度是否匹配某种证书类型
+    if (response_len == sizeof(ImpCert) + SM2_PRI_MAX_SIZE) {
+        // V1证书格式：证书结构体 + 部分私钥r
+        memcpy(&cert, response_data, sizeof(ImpCert));
+        memcpy(r, response_data + sizeof(ImpCert), SM2_PRI_MAX_SIZE);
+        printf("已成功接收V1证书和部分私钥r\n");
+    } 
+    else if (response_len == sizeof(ImpCert) + sizeof(ImpCertExt) + SM2_PRI_MAX_SIZE) {
+        // V2证书格式：证书结构体 + 扩展信息 + 部分私钥r
+        memcpy(&cert, response_data, sizeof(ImpCert));
+        
+        // 为扩展信息分配内存
+        cert.Extensions = (ImpCertExt *)malloc(sizeof(ImpCertExt));
+        if (!cert.Extensions) {
+            printf("扩展信息内存分配失败\n");
+            free(response_data);
+            goto cleanup;
+        }
+        
+        // 提取扩展信息
+        memcpy(cert.Extensions, response_data + sizeof(ImpCert), sizeof(ImpCertExt));
+        // 提取部分私钥r
+        memcpy(r, response_data + sizeof(ImpCert) + sizeof(ImpCertExt), SM2_PRI_MAX_SIZE);
+        
+        printf("已成功接收V2证书和部分私钥r\n");
+    } 
+    else {
         printf("接收到的数据长度错误: %d\n", response_len);
         free(response_data);
         goto cleanup;
     }
     
-    // 解析证书和部分私钥r
-    ImpCert cert;
-    unsigned char r[SM2_PRI_MAX_SIZE];
-    memcpy(&cert, response_data, sizeof(ImpCert));
-    memcpy(r, response_data + sizeof(ImpCert), SM2_PRI_MAX_SIZE);
     free(response_data);
-
-    // 准备文件名
-    char pub_key_filename[SUBJECT_ID_SIZE + 10] = {0}; // ID + "_pub.key"
-    char priv_key_filename[SUBJECT_ID_SIZE + 11] = {0}; // ID + "_priv.key"
-    char cert_filename[SUBJECT_ID_SIZE + 5] = {0}; // ID + ".crt"
-    
-    sprintf(pub_key_filename, "%s_pub.key", user_id);
-    sprintf(priv_key_filename, "%s_priv.key", user_id);
-    sprintf(cert_filename, "%s.crt", user_id);
-
-    printf("已成功接收证书和部分私钥r\n");
-    // 保存证书供后续使用
-    if(!save_cert(&cert, cert_filename)){
-        printf("保存证书失败\n");
-        goto cleanup;
-    }
     
     //--------step3:用户端生成最终的公私钥对-------------
     // 获取隐式证书中的Pu
@@ -509,7 +515,7 @@ int request_registration(const char *user_id) {
     
     // 计算隐式证书哈希值
     unsigned char e[32];
-    sm3_hash((const unsigned char *)&cert, sizeof(ImpCert), e);
+    calc_cert_hash(&cert, e);
     print_hex("隐式证书哈希值e", e, 32);
     
     // 公钥重构 Qu=e×Pu+Q_ca
@@ -533,7 +539,23 @@ int request_registration(const char *user_id) {
     // 更新全局变量
     memcpy(priv_key, d_u, SM2_PRI_MAX_SIZE);
     memcpy(pub_key, Qu, SM2_PUB_MAX_SIZE);
+
+    //--------step4:用户端保存证书和最终的公私钥对-------------
     
+    // 准备文件名
+    char pub_key_filename[SUBJECT_ID_LEN + 9] = {0}; // ID + "_pub.key"
+    char priv_key_filename[SUBJECT_ID_LEN + 10] = {0}; // ID + "_priv.key"
+    char cert_filename[SUBJECT_ID_LEN + 5] = {0}; // ID + ".crt"
+    sprintf(pub_key_filename, "%s_pub.key", user_id);
+    sprintf(priv_key_filename, "%s_priv.key", user_id);
+    sprintf(cert_filename, "%s.crt", user_id);
+        
+    // 保存证书供后续使用
+    if(!save_cert(&cert, cert_filename)){
+        printf("保存证书失败\n");
+        goto cleanup;
+    }
+
     // 保存用户私钥供后续使用
     FILE *key_file = fopen(priv_key_filename, "wb");
     if (key_file) {
@@ -559,6 +581,7 @@ cleanup:
     if (Ku) BN_free(Ku);
     if (Ru) EC_POINT_free(Ru);
     if (Pu) EC_POINT_free(Pu);
+    if (cert.Extensions) free(cert.Extensions);
     return ret;
 }
 
@@ -566,6 +589,7 @@ int request_cert_update(const char *user_id) {
     BIGNUM *Ku = NULL;
     EC_POINT *Ru = NULL;
     EC_POINT *Pu = NULL;
+    ImpCert new_cert = {0};
     int ret = 0;
 
     //--------step1:用户端-----------
@@ -586,7 +610,7 @@ int request_cert_update(const char *user_id) {
                                      Ru_bytes, SM2_PUB_MAX_SIZE, NULL);
     
     // 准备要签名的数据：ID + Ru（先ID后Ru）
-    unsigned char sign_data[SUBJECT_ID_SIZE + SM2_PUB_MAX_SIZE];
+    unsigned char sign_data[SUBJECT_ID_LEN + SM2_PUB_MAX_SIZE];
     memcpy(sign_data, user_id, SUBJECT_ID_LEN);
     memcpy(sign_data + SUBJECT_ID_LEN, Ru_bytes, ru_len);
     
@@ -598,7 +622,7 @@ int request_cert_update(const char *user_id) {
     }
     
     // 准备发送的完整数据：ID + Ru + 签名
-    unsigned char send_data[SUBJECT_ID_SIZE + SM2_PUB_MAX_SIZE + 64];
+    unsigned char send_data[SUBJECT_ID_LEN + SM2_PUB_MAX_SIZE + 64];
     memcpy(send_data, sign_data, SUBJECT_ID_LEN + ru_len);
     memcpy(send_data + SUBJECT_ID_LEN + ru_len, signature, 64);
     
@@ -614,27 +638,43 @@ int request_cert_update(const char *user_id) {
         goto cleanup;
     }
     
-    // 验证响应数据
-    if (response_len != sizeof(ImpCert) + SM2_PRI_MAX_SIZE) {
+    // 解析新证书基本信息
+    unsigned char r[SM2_PRI_MAX_SIZE];
+    
+    // 直接判断响应长度是否匹配某种证书类型
+    if (response_len == sizeof(ImpCert) + SM2_PRI_MAX_SIZE) {
+        // V1证书格式：证书结构体 + 部分私钥r
+        memcpy(&new_cert, response_data, sizeof(ImpCert));
+        memcpy(r, response_data + sizeof(ImpCert), SM2_PRI_MAX_SIZE);
+
+        printf("已成功接收更新后的V1证书和部分私钥r\n");
+    } 
+    else if (response_len == sizeof(ImpCert) + sizeof(ImpCertExt) + SM2_PRI_MAX_SIZE) {
+        // V2证书格式：证书结构体 + 扩展信息 + 部分私钥r
+        memcpy(&new_cert, response_data, sizeof(ImpCert));
+
+        // 为扩展信息分配内存
+        new_cert.Extensions = (ImpCertExt *)malloc(sizeof(ImpCertExt));
+        if (!new_cert.Extensions) {
+            printf("扩展信息内存分配失败\n");
+            free(response_data);
+            goto cleanup;
+        }
+        
+        // 提取扩展信息
+        memcpy(new_cert.Extensions, response_data + sizeof(ImpCert), sizeof(ImpCertExt));
+        // 提取部分私钥r
+        memcpy(r, response_data + sizeof(ImpCert) + sizeof(ImpCertExt), SM2_PRI_MAX_SIZE);
+        
+        printf("已成功接收更新后的V2证书和部分私钥r\n");
+    } 
+    else {
         printf("接收到的数据长度错误: %d\n", response_len);
         free(response_data);
         goto cleanup;
     }
     
-    // 解析新证书和部分私钥r
-    ImpCert new_cert;
-    unsigned char r[SM2_PRI_MAX_SIZE];
-    memcpy(&new_cert, response_data, sizeof(ImpCert));
-    memcpy(r, response_data + sizeof(ImpCert), SM2_PRI_MAX_SIZE);
     free(response_data);
-    
-    // 保存新证书供后续使用
-    char cert_filename[SUBJECT_ID_SIZE + 5] = {0}; // ID + ".crt"
-    sprintf(cert_filename, "%s.crt", user_id);
-    if (!save_cert(&new_cert, cert_filename)) {
-        printf("保存新证书失败\n");
-        goto cleanup;
-    }
     
     //--------step3:用户端生成最终的公私钥对-------------
     // 获取隐式证书中的Pu
@@ -646,7 +686,7 @@ int request_cert_update(const char *user_id) {
 
     // 计算隐式证书哈希值
     unsigned char e[32];
-    sm3_hash((const unsigned char *)&new_cert, sizeof(ImpCert), e);
+    calc_cert_hash(&new_cert, e);
     print_hex("新隐式证书哈希值e", e, 32);
     
     // 公钥重构 Qu=e×Pu+Q_ca
@@ -670,10 +710,23 @@ int request_cert_update(const char *user_id) {
     memcpy(priv_key, d_u, SM2_PRI_MAX_SIZE);
     memcpy(pub_key, Qu, SM2_PUB_MAX_SIZE);
 
-    // 保存用户新私钥供后续使用
-    char priv_key_filename[SUBJECT_ID_SIZE + 11] = {0}; // ID + "_priv.key"
+    //--------step4:用户端保存证书和最终的公私钥对-------------
+    // 准备文件名
+    char pub_key_filename[SUBJECT_ID_LEN + 9] = {0}; // ID + "_pub.key"
+    char priv_key_filename[SUBJECT_ID_LEN + 10] = {0}; // ID + "_priv.key"
+    char cert_filename[SUBJECT_ID_LEN + 5] = {0}; // ID + ".crt"
+    sprintf(pub_key_filename, "%s_pub.key", user_id);
     sprintf(priv_key_filename, "%s_priv.key", user_id);
-    
+    sprintf(cert_filename, "%s.crt", user_id);
+
+    // 保存新证书供后续使用
+    sprintf(cert_filename, "%s.crt", user_id);
+    if (!save_cert(&new_cert, cert_filename)) {
+        printf("保存新证书失败\n");
+        goto cleanup;
+    }
+
+    // 保存用户新私钥供后续使用
     FILE *key_file = fopen(priv_key_filename, "wb");
     if (key_file) {
         fwrite(d_u, 1, SM2_PRI_MAX_SIZE, key_file);
@@ -683,9 +736,6 @@ int request_cert_update(const char *user_id) {
     }
     
     // 保存用户新公钥供后续使用
-    char pub_key_filename[SUBJECT_ID_SIZE + 10] = {0}; // ID + "_pub.key"
-    sprintf(pub_key_filename, "%s_pub.key", user_id);
-    
     FILE *pub_key_file = fopen(pub_key_filename, "wb");
     if (pub_key_file) {
         fwrite(Qu, 1, SM2_PUB_MAX_SIZE, pub_key_file);
@@ -701,6 +751,7 @@ cleanup:
     if (Ku) BN_free(Ku);
     if (Ru) EC_POINT_free(Ru);
     if (Pu) EC_POINT_free(Pu);
+    if (new_cert.Extensions) free(new_cert.Extensions);
     return ret;
 }
 
@@ -712,11 +763,6 @@ int send_signed_message(const char *user_id, const char *message) {
         return 0;
     }
     
-    if (!has_cert) {
-        printf("错误：需要先加载证书才能发送消息\n");
-        return 0;
-    }
-    
     // 对消息进行签名
     unsigned char signature[64];
     if (!sm2_sign(signature, (const unsigned char *)message, message_len, priv_key)) {
@@ -724,9 +770,19 @@ int send_signed_message(const char *user_id, const char *message) {
         return 0;
     }
     
-    // 准备要发送的数据：消息长度(2字节) + 消息内容 + 签名(64字节) + 证书
-    // 总长度：2 + message_len + 64 + sizeof(ImpCert)
-    int data_size = 2 + message_len + 64 + sizeof(ImpCert);
+    // 计算数据大小，根据证书版本决定
+    int data_size;
+    
+    // 2字节消息长度 + 消息内容 + 64字节签名 + ImpCert基本结构
+    int cert_base_size = sizeof(ImpCert) - sizeof(ImpCertExt*);
+    data_size = 2 + message_len + 64 + cert_base_size;
+    
+    // 如果是V2证书，需要额外添加扩展信息的大小
+    if (loaded_cert.Version == CERT_V2 && loaded_cert.Extensions) {
+        data_size += sizeof(ImpCertExt);
+    }
+    
+    // 分配内存
     unsigned char *send_data = (unsigned char *)malloc(data_size);
     if (!send_data) {
         printf("内存分配失败\n");
@@ -739,12 +795,17 @@ int send_signed_message(const char *user_id, const char *message) {
     
     // 填充消息内容
     memcpy(send_data + 2, message, message_len);
-    
     // 填充签名
     memcpy(send_data + 2 + message_len, signature, 64);
     
-    // 填充证书
-    memcpy(send_data + 2 + message_len + 64, &loaded_cert, sizeof(ImpCert));
+    // 填充证书基本信息（排除Extensions指针）
+    memcpy(send_data + 2 + message_len + 64, &loaded_cert, cert_base_size);
+    
+    // 如果是V2证书，还需要填充扩展信息
+    if (loaded_cert.Version == CERT_V2 && loaded_cert.Extensions) {
+        memcpy(send_data + 2 + message_len + 64 + cert_base_size, 
+               loaded_cert.Extensions, sizeof(ImpCertExt));
+    }
     
     // 使用HTTP发送数据
     unsigned char *response_data = NULL;

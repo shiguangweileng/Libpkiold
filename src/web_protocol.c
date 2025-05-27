@@ -1,11 +1,11 @@
 #include "web_protocol.h"
+#include "imp_cert.h"
 
 // 定义CA服务器的IP和端口
 #define CA_IP "127.0.0.1"
 #define CA_PORT 8001
 
 // 用户数据结构
-#define SUBJECT_ID_SIZE 9   // 8字符ID + 结束符
 #define CERT_HASH_SIZE 32   // 证书哈希32字节
 
 typedef struct {
@@ -193,7 +193,7 @@ int request_user_list(int ca_socket, void **users, int *user_count) {
         memcpy(&new_user_count, buffer, sizeof(int));
         
         // 检查数据大小是否合理
-        if (data_len == sizeof(int) + new_user_count * (SUBJECT_ID_SIZE + CERT_HASH_SIZE)) {
+        if (data_len == sizeof(int) + new_user_count * (SUBJECT_ID_LEN + CERT_HASH_SIZE)) {
             // 释放旧数据
             if (*users) {
                 free(*users);
@@ -211,9 +211,10 @@ int request_user_list(int ca_socket, void **users, int *user_count) {
                     int offset = sizeof(int);
                     for (int i = 0; i < *user_count; i++) {
                         UserInfo *userInfo = (UserInfo*)*users;
-                        // 复制用户ID
-                        memcpy(userInfo[i].id, buffer + offset, SUBJECT_ID_SIZE);
-                        offset += SUBJECT_ID_SIZE;
+                        // 复制用户ID（4字节）并添加字符串结尾符
+                        memcpy(userInfo[i].id, buffer + offset, SUBJECT_ID_LEN);
+                        userInfo[i].id[SUBJECT_ID_LEN] = '\0'; // 添加字符串结尾符
+                        offset += SUBJECT_ID_LEN;
                         
                         // 复制证书哈希
                         memcpy(userInfo[i].cert_hash, buffer + offset, CERT_HASH_SIZE);
@@ -459,5 +460,67 @@ int request_revoke_cert(int ca_socket, const char *user_id) {
     }
     
     return result;
+}
+
+// 请求设置证书版本
+int request_set_cert_version(int ca_socket, unsigned char version) {
+    unsigned char buffer[BUFFER_SIZE];
+    uint8_t cmd;
+    int data_len;
+    int result = 0;
+
+    if (ca_socket < 0 || (version != CERT_V1 && version != CERT_V2)) {
+        return 0;
+    }
+
+    // 发送版本号
+    if (!send_message(ca_socket, WEB_CMD_SET_CERT_VERSION, &version, 1)) {
+        return 0;
+    }
+    
+    // 接收响应
+    data_len = recv_message(ca_socket, &cmd, buffer, BUFFER_SIZE);
+    if (data_len < 0 || cmd != WEB_CMD_VERSION_RESULT) {
+        return 0;
+    }
+    
+    // 处理响应结果
+    if (data_len > 0) {
+        // 结果为1字节，1表示成功，0表示失败
+        result = buffer[0];
+    }
+    
+    return result;
+}
+
+// 请求获取当前证书版本
+int request_get_cert_version(int ca_socket) {
+    unsigned char buffer[BUFFER_SIZE];
+    uint8_t cmd;
+    int data_len;
+    unsigned char version = 0;
+
+    if (ca_socket < 0) {
+        return 0;
+    }
+
+    if (!send_message(ca_socket, WEB_CMD_GET_CERT_VERSION, NULL, 0)) {
+        return 0;
+    }
+
+    data_len = recv_message(ca_socket, &cmd, buffer, BUFFER_SIZE);
+    if (data_len < 0 || cmd != WEB_CMD_CERT_VERSION_DATA) {
+        return 0;
+    }
+
+    if (data_len == 1) {
+        version = buffer[0];
+        if (version != CERT_V1 && version != CERT_V2) {
+            return 0;
+        }
+    } else {
+        return 0;
+    }
+    return (int)version;
 }
 

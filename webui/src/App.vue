@@ -4,6 +4,7 @@ import UserList from './components/UserList.vue'
 import CRLList from './components/CRLList.vue'
 import LocalMode from './components/LocalMode.vue'
 import MessageCenter from './components/MessageCenter.vue'
+import CertVersionManager from './components/CertVersionManager.vue'
 
 const activeMenu = ref('users')
 
@@ -11,7 +12,8 @@ const menuItems = [
   { id: 'users', name: '用户列表' },
   { id: 'crl', name: '证书撤销列表' },
   { id: 'localmode', name: '本地模式' },
-  { id: 'message', name: '消息中心' }
+  { id: 'message', name: '消息中心' },
+  { id: 'certversion', name: '证书版本管理' }
 ]
 </script>
 
@@ -34,6 +36,7 @@ const menuItems = [
       <CRLList v-if="activeMenu === 'crl'" />
       <LocalMode v-if="activeMenu === 'localmode'" />
       <MessageCenter v-if="activeMenu === 'message'" />
+      <CertVersionManager v-if="activeMenu === 'certversion'" />
     </div>
   </div>
 </template>
