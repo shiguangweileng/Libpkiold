@@ -3,6 +3,7 @@ server/user-client/user
 server/user-client/auto_test
 server/user-client/func_test
 **/ca_web
+zlog_test
 
 # 用户数据
 U*.crt

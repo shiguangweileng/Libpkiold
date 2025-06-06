@@ -2,6 +2,9 @@
 #include "gm_crypto.h"
 #include <endian.h>
 #include <time.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
 
 // 全局SM2参数
 EC_GROUP *group = NULL;
@@ -290,6 +293,71 @@ int parse_hex_hash(unsigned char *cert_hash, int hash_size) {
 void clear_input_buffer() {
     int c;
     while ((c = getchar()) != '\n' && c != EOF);
+}
+
+// 安全删除文件 - 通过5次随机数据覆写确保文件内容不可恢复
+int secure_delete_file(const char *filename) {
+    FILE *file = fopen(filename, "r+b");
+    if (!file) {
+        // 文件不存在或无法打开，不需要安全删除
+        return 1;
+    }
+    
+    // 获取文件大小
+    fseek(file, 0, SEEK_END);
+    long file_size = ftell(file);
+    fseek(file, 0, SEEK_SET);
+    
+    if (file_size <= 0) {
+        fclose(file);
+        remove(filename);
+        return 1;
+    }
+    
+    // 分配覆写缓冲区
+    unsigned char *buffer = malloc(file_size);
+    if (!buffer) {
+        fclose(file);
+        printf("内存分配失败，无法安全删除文件: %s\n", filename);
+        return 0;
+    }
+    
+    int pass_count = 5;  // 使用随机数据覆写5次
+    int ret = 1;
+    
+    // 覆写文件内容
+    for (int pass = 0; pass < pass_count; pass++) {
+        // 生成随机数据
+        for (long i = 0; i < file_size; i++) {
+            buffer[i] = rand() & 0xFF;
+        }
+        
+        // 覆写文件
+        fseek(file, 0, SEEK_SET);
+        if (fwrite(buffer, 1, file_size, file) != (size_t)file_size) {
+            printf("覆写文件失败: %s\n", filename);
+            ret = 0;
+            goto cleanup;
+        }
+        
+        // 确保数据写入磁盘
+        fflush(file);
+        fsync(fileno(file));
+    }
+    
+cleanup:
+    if (buffer) {
+        free(buffer);
+    }
+    fclose(file);
+    
+    // 最后删除文件
+    if (remove(filename) != 0) {
+        printf("删除文件失败: %s\n", filename);
+        return 0;
+    }
+    
+    return ret;
 }
 
 

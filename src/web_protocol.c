@@ -1,5 +1,6 @@
 #include "web_protocol.h"
 #include "imp_cert.h"
+#include "hashmap.h"
 
 // 定义CA服务器的IP和端口
 #define CA_IP "127.0.0.1"
@@ -13,11 +14,14 @@ typedef struct {
     unsigned char cert_hash[CERT_HASH_SIZE];
 } UserInfo;
 
-// CRL数据结构
+// Web端使用的CRL数据结构，包含证书哈希
 typedef struct {
-    unsigned char cert_hash[CERT_HASH_SIZE];
-    time_t expire_time;
-} CRLEntry;
+    unsigned char cert_hash[CERT_HASH_SIZE]; // 证书哈希
+    time_t expire_time;      // 证书到期时间
+    time_t revoke_time;      // 证书撤销时间
+    char revoke_by[SUBJECT_ID_SIZE]; // 撤销人ID
+    unsigned char reason;    // 撤销原因代码
+} WebCRLEntry;
 
 int setup_server(int port) {
     int server_fd;
@@ -233,7 +237,7 @@ int request_user_list(int ca_socket, void **users, int *user_count) {
 }
 
 // 请求用户证书
-int request_user_certificate(int ca_socket, const char *user_id, unsigned char *cert_data, int max_size) {
+int request_user_cert(int ca_socket, const char *user_id, unsigned char *cert_data, int max_size) {
     unsigned char buffer[BUFFER_SIZE];
     int data_len;
     uint8_t cmd;
@@ -309,7 +313,9 @@ int request_crl_list(int ca_socket, void **crl_entries, int *crl_count, int *bas
         offset += sizeof(int);
         
         // 检查数据大小是否合理
-        if (data_len == sizeof(int) * 3 + new_crl_count * (CERT_HASH_SIZE + sizeof(time_t))) {
+        // 计算CRL传输格式大小 (证书哈希 + CRLEntry)
+        size_t crl_transfer_size = CERT_HASH_SIZE + sizeof(CRLEntry);
+        if (data_len >= sizeof(int) * 3 && data_len >= sizeof(int) * 3 + new_crl_count * crl_transfer_size) {
             // 释放旧数据
             if (*crl_entries) {
                 free(*crl_entries);
@@ -318,21 +324,22 @@ int request_crl_list(int ca_socket, void **crl_entries, int *crl_count, int *bas
             }
             
             // 分配新内存
-            if (new_crl_count > 0) {
-                *crl_entries = (CRLEntry*)malloc(sizeof(CRLEntry) * new_crl_count);
-                if (*crl_entries) {
-                    *crl_count = new_crl_count;
-                    
-                    // 解析CRL数据
-                    for (int i = 0; i < *crl_count; i++) {
-                        CRLEntry *crlEntries = (CRLEntry*)*crl_entries;
-                        // 复制证书哈希
-                        memcpy(crlEntries[i].cert_hash, buffer + offset, CERT_HASH_SIZE);
-                        offset += CERT_HASH_SIZE;
+                            if (new_crl_count > 0) {
+                    *crl_entries = (WebCRLEntry*)malloc(sizeof(WebCRLEntry) * new_crl_count);
+                    if (*crl_entries) {
+                        *crl_count = new_crl_count;
                         
-                        // 复制到期时间
-                        memcpy(&crlEntries[i].expire_time, buffer + offset, sizeof(time_t));
-                        offset += sizeof(time_t);
+                        // 解析CRL数据
+                        for (int i = 0; i < *crl_count; i++) {
+                            WebCRLEntry *webCRLEntries = (WebCRLEntry*)*crl_entries;
+                            
+                            // 复制证书哈希
+                            memcpy(webCRLEntries[i].cert_hash, buffer + offset, CERT_HASH_SIZE);
+                            offset += CERT_HASH_SIZE;
+                            
+                            // 复制CRLEntry结构体 (expire_time, revoke_time, revoke_by, reason)
+                            memcpy(&webCRLEntries[i].expire_time, buffer + offset, sizeof(CRLEntry));
+                            offset += sizeof(CRLEntry);
                     }
                     result = 1;
                 }

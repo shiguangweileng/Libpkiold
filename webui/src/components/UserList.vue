@@ -135,7 +135,7 @@ async function viewCertificate(userId) {
   }
 }
 
-// 撤销证书（暂未实现功能）
+// 撤销证书
 function revokeCertificate(userId) {
   const confirmRevoke = confirm(`确定要撤销用户 ${userId} 的证书吗？此操作不可撤销。`);
   if (!confirmRevoke) return;
@@ -296,6 +296,11 @@ onMounted(() => {
         
         <div v-else-if="selectedCert" class="cert-details">
           <div class="cert-field">
+            <div class="cert-label">版本</div>
+            <div class="cert-value">V{{ selectedCert.version }}</div>
+          </div>
+          
+          <div class="cert-field">
             <div class="cert-label">序列号</div>
             <div class="cert-value">{{ selectedCert.serialNum }}</div>
           </div>
@@ -312,12 +317,12 @@ onMounted(() => {
           
           <div class="cert-field">
             <div class="cert-label">生效时间</div>
-            <div class="cert-value">{{ formatTimestamp(selectedCert.validFrom) }}</div>
+            <div class="cert-value">{{ selectedCert.validFrom }}</div>
           </div>
           
           <div class="cert-field">
             <div class="cert-label">过期时间</div>
-            <div class="cert-value">{{ formatTimestamp(selectedCert.validTo) }}</div>
+            <div class="cert-value">{{ selectedCert.validTo }}</div>
           </div>
           
           <div class="cert-field">
@@ -330,9 +335,34 @@ onMounted(() => {
             <div class="cert-value cert-pubkey">{{ selectedCert.pubKey }}</div>
           </div>
 
+          <!-- 显示V2证书的扩展信息 -->
+          <div v-if="selectedCert.version === 2 && selectedCert.extensions" class="extensions-section">
+            <h3 class="extensions-title">扩展信息</h3>
+            
+            <div class="cert-field">
+              <div class="cert-label">证书用途</div>
+              <div class="cert-value">{{ selectedCert.extensions.usage }}</div>
+            </div>
+            
+            <div class="cert-field">
+              <div class="cert-label">签名算法</div>
+              <div class="cert-value">{{ selectedCert.extensions.signAlg }}</div>
+            </div>
+            
+            <div class="cert-field">
+              <div class="cert-label">哈希算法</div>
+              <div class="cert-value">{{ selectedCert.extensions.hashAlg }}</div>
+            </div>
+            
+            <div class="cert-field">
+              <div class="cert-label">额外信息</div>
+              <div class="cert-value">{{ selectedCert.extensions.extraInfo }}</div>
+            </div>
+          </div>
+
           <div class="cert-status" :class="selectedCert.isValid ? 'valid' : 'invalid'">
             <div class="status-indicator"></div>
-            {{ selectedCert.isValid ? '证书有效' : (selectedCert.isRevoked ? '证书已被撤销' : '证书已过期') }}
+            {{ selectedCert.isValid ? '证书有效' : '证书无效' }}
           </div>
         </div>
       </div>
@@ -675,5 +705,19 @@ td {
 
 .invalid .status-indicator {
   background-color: #ef4444;
+}
+
+/* 添加扩展信息样式 */
+.extensions-section {
+  margin-top: 16px;
+  padding-top: 16px;
+  border-top: 1px solid #e2e8f0;
+}
+
+.extensions-title {
+  font-size: 18px;
+  font-weight: 600;
+  color: #334155;
+  margin-bottom: 16px;
 }
 </style> 

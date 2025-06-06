@@ -8,7 +8,7 @@ ca_server_dir="$SCRIPT_DIR/server/ca-server"
 user_client_dir="$SCRIPT_DIR/server/user-client"
 
 # 定义ca-server目录的白名单文件列表
-ca_server_whitelist=("UserCerts" "UserData" "ca" "ca_priv.key" "ca_pub.key" "ca.c" "SerialNum.txt")
+ca_server_whitelist=("UserCerts" "UserData" "logs" "zlog.conf" "ca" "ca_priv.key" "ca_pub.key" "ca.c" "SerialNum.txt")
 
 # 定义user-client目录的白名单文件列表
 user_client_whitelist=("user" "user.c" "ca.crt" "ca_pub.key" "usercore.c" "func_test.c" "func_test")
@@ -22,6 +22,14 @@ for file in *; do
   fi
 done
 
+# 清空logs目录中的所有文件，但保留目录本身
+if [ -d "$ca_server_dir/logs" ]; then
+  rm -f "$ca_server_dir/logs"/*
+  echo "logs 目录中的文件已清空"
+else
+  echo "警告: logs 目录不存在"
+fi
+
 # 清空UserCerts目录中的所有文件，但保留目录本身
 if [ -d "$ca_server_dir/UserCerts" ]; then
   rm -f "$ca_server_dir/UserCerts"/*
@@ -30,7 +38,7 @@ else
   echo "警告: UserCerts 目录不存在"
 fi
 
-# 清空目录中的所有文件，但保留目录本身
+# 清空UserData目录中的所有文件，但保留目录本身
 if [ -d "$ca_server_dir/UserData" ]; then
   rm -f "$ca_server_dir/UserData"/*
   echo "UserData 目录中的文件已清空"

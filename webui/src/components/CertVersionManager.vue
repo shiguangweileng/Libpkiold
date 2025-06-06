@@ -23,8 +23,8 @@ const certVersions = [
     fields: [
       { name: 'Version', type: '1字节', description: '证书版本号' },
       { name: 'SerialNum', type: '9字节', description: '证书序列号，例如"SN000001"' },
-      { name: 'IssuerID', type: '5字节', description: '颁发者ID，例如"CA01"' },
-      { name: 'SubjectID', type: '5字节', description: '主体ID，例如"U001"' },
+      { name: 'IssuerID', type: '4字节', description: '颁发者ID，例如"CA01"' },
+      { name: 'SubjectID', type: '4字节', description: '主体ID，例如"U001"' },
       { name: 'Validity', type: '16字节', description: '有效期，包含起止日期' },
       { name: 'PubKey', type: '33字节', description: '公钥重构值' }
     ],
@@ -36,8 +36,8 @@ const certVersions = [
     fields: [
       { name: 'Version', type: '1字节', description: '证书版本号' },
       { name: 'SerialNum', type: '9字节', description: '证书序列号，例如"SN000001"' },
-      { name: 'IssuerID', type: '5字节', description: '颁发者ID，例如"CA01"' },
-      { name: 'SubjectID', type: '5字节', description: '主体ID，例如"U001"' },
+      { name: 'IssuerID', type: '4字节', description: '颁发者ID，例如"CA01"' },
+      { name: 'SubjectID', type: '4字节', description: '主体ID，例如"U001"' },
       { name: 'Validity', type: '16字节', description: '有效期，包含起止日期' },
       { name: 'PubKey', type: '33字节', description: '公钥重构值' },
     ],

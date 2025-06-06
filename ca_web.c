@@ -26,9 +26,12 @@ typedef struct {
 
 // CRL数据结构
 typedef struct {
-    unsigned char cert_hash[CERT_HASH_SIZE];
-    time_t expire_time;
-} CRLEntry;
+    unsigned char cert_hash[CERT_HASH_SIZE]; // 证书哈希
+    time_t expire_time;      // 证书到期时间
+    time_t revoke_time;      // 证书撤销时间
+    char revoke_by[SUBJECT_ID_SIZE]; // 撤销人ID
+    unsigned char reason;    // 撤销原因代码
+} WebCRLEntry; // 前端使用的CRL结构体，包含证书哈希
 
 // 版本信息数据结构
 typedef struct {
@@ -42,7 +45,7 @@ pthread_mutex_t ca_socket_mutex = PTHREAD_MUTEX_INITIALIZER; // CA连接互斥�
 UserInfo* users = NULL;           // 用户列表数据
 int user_count = 0;               // 用户数量
 pthread_mutex_t users_mutex = PTHREAD_MUTEX_INITIALIZER; // 用户数据互斥锁
-CRLEntry* crl_entries = NULL;     // CRL列表数据
+WebCRLEntry* crl_entries = NULL;  // CRL列表数据
 int crl_count = 0;                // CRL条目数量
 CRLVersion crl_version = {0, 0};  // CRL版本信息
 pthread_mutex_t crl_mutex = PTHREAD_MUTEX_INITIALIZER; // CRL数据互斥锁
@@ -56,13 +59,13 @@ unsigned char Q_ca[SM2_PUB_MAX_SIZE]; // CA公钥，用于重构用户公钥
 int handle_cors_preflight(struct MHD_Connection *connection);
 int handle_user_list(struct MHD_Connection *connection);
 int handle_crl_list(struct MHD_Connection *connection);
-int handle_user_certificate(struct MHD_Connection *connection, const char *url);
+int handle_user_cert(struct MHD_Connection *connection, const char *url);
 int handle_cleanup_expired_certs(struct MHD_Connection *connection);
 int handle_local_cert_operation(struct MHD_Connection *connection, const char *url, const char *upload_data, size_t *upload_data_size, int is_generate);
 int handle_keypair_with_param(struct MHD_Connection *connection);
 int handle_sign_message(struct MHD_Connection *connection, const char *upload_data, size_t *upload_data_size);
 int handle_verify_signature(struct MHD_Connection *connection, const char *upload_data, size_t *upload_data_size);
-int handle_revoke_certificate(struct MHD_Connection *connection, const char *upload_data, size_t *upload_data_size);
+int handle_revoke_cert(struct MHD_Connection *connection, const char *upload_data, size_t *upload_data_size);
 int handle_cert_version(struct MHD_Connection *connection);
 int handle_set_cert_version(struct MHD_Connection *connection, const char *upload_data, size_t *upload_data_size);
 // 工具函数
@@ -312,21 +315,22 @@ int handle_crl_list(struct MHD_Connection *connection) {
     if (ca_socket >= 0) {
         request_crl_list(ca_socket, &new_crl_entries, &new_crl_count, &new_base_v, &new_removed_v);
         
-        pthread_mutex_lock(&crl_mutex);
-        // 更新版本信息
-        crl_version.base_v = new_base_v;
-        crl_version.removed_v = new_removed_v;
-        
-        // 释放旧数据
-        if (crl_entries) {
-            free(crl_entries);
-        }
-        
-        // 更新CRL数据
-        crl_entries = (CRLEntry*)new_crl_entries;
-        crl_count = new_crl_count;
-        
-        pthread_mutex_unlock(&crl_mutex);
+            pthread_mutex_lock(&crl_mutex);
+    // 更新版本信息
+    crl_version.base_v = new_base_v;
+    crl_version.removed_v = new_removed_v;
+    
+    // 释放旧数据
+    if (crl_entries) {
+        free(crl_entries);
+        crl_entries = NULL; // 防止释放后使用指针
+    }
+    
+    // 更新CRL数据
+    crl_entries = (WebCRLEntry*)new_crl_entries;
+    crl_count = new_crl_count;
+    
+    pthread_mutex_unlock(&crl_mutex);
     }
     pthread_mutex_unlock(&ca_socket_mutex);
     
@@ -353,10 +357,32 @@ int handle_crl_list(struct MHD_Connection *connection) {
         json_object_object_add(crl_item, "certHash", json_object_new_string(hash_hex));
         
         // 到期时间（转为ISO 8601格式）
-        char time_str[32] = {0};
+        char expire_time_str[32] = {0};
         struct tm *tm_info = localtime(&crl_entries[i].expire_time);
-        strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", tm_info);
-        json_object_object_add(crl_item, "expireTime", json_object_new_string(time_str));
+        strftime(expire_time_str, sizeof(expire_time_str), "%Y-%m-%d %H:%M:%S", tm_info);
+        json_object_object_add(crl_item, "expireTime", json_object_new_string(expire_time_str));
+        
+        // 撤销时间
+        char revoke_time_str[32] = {0};
+        tm_info = localtime(&crl_entries[i].revoke_time);
+        strftime(revoke_time_str, sizeof(revoke_time_str), "%Y-%m-%d %H:%M:%S", tm_info);
+        json_object_object_add(crl_item, "revokeTime", json_object_new_string(revoke_time_str));
+        
+        // 撤销人ID
+        json_object_object_add(crl_item, "revokeBy", json_object_new_string(crl_entries[i].revoke_by));
+        
+        // 撤销原因
+        const char *reason_str = "";
+        switch (crl_entries[i].reason) {
+            case 1: reason_str = "证书过期"; break;
+            case 2: reason_str = "证书更新"; break;
+            case 3: reason_str = "密钥泄露"; break;
+            case 4: reason_str = "业务终止"; break;
+            case 5: reason_str = "其他"; break;
+            default: reason_str = "未知原因";
+        }
+        json_object_object_add(crl_item, "reason", json_object_new_string(reason_str));
+        
         json_object_array_add(crl_array, crl_item);
     }
     
@@ -372,20 +398,20 @@ int handle_crl_list(struct MHD_Connection *connection) {
 }
 
 // 处理获取单个用户证书请求
-int handle_user_certificate(struct MHD_Connection *connection, const char *url) {
+int handle_user_cert(struct MHD_Connection *connection, const char *url) {
     // 获取userId参数
     const char *user_id = MHD_lookup_connection_value(connection, MHD_GET_ARGUMENT_KIND, "userId");
-    if (!user_id || strlen(user_id) != 8) {
+    if (!user_id || strlen(user_id) != 4) {
         return send_json_error(connection, MHD_HTTP_BAD_REQUEST, "无效的用户ID");
     }
     
-    // 请求证书数据，格式：证书结构体 + 哈希值(32字节) + 有效性标志(1字节) + 撤销标志(1字节)
+    // 请求证书数据
     unsigned char cert_data[BUFFER_SIZE];
     
     pthread_mutex_lock(&ca_socket_mutex);
     int data_len = 0;
     if (ca_socket >= 0) {
-        data_len = request_user_certificate(ca_socket, user_id, cert_data, BUFFER_SIZE);
+        data_len = request_user_cert(ca_socket, user_id, cert_data, BUFFER_SIZE);
     }
     pthread_mutex_unlock(&ca_socket_mutex);
     
@@ -396,16 +422,27 @@ int handle_user_certificate(struct MHD_Connection *connection, const char *url) 
     // 解析证书数据
     ImpCert cert;
     unsigned char cert_hash[32];
-    uint8_t is_valid, is_revoked;
+    uint8_t is_valid;
     
     // 证书结构体
     memcpy(&cert, cert_data, sizeof(ImpCert));
+    
+    // 根据证书版本处理不同格式的数据
+    int offset = sizeof(ImpCert);
+    ImpCertExt extensions;
+    
+    if (cert.Version == CERT_V2) {
+        // V2版本包含扩展信息
+        memcpy(&extensions, cert_data + offset, sizeof(ImpCertExt));
+        offset += sizeof(ImpCertExt);
+    }
+    
     // 证书哈希
-    memcpy(cert_hash, cert_data + sizeof(ImpCert), 32);
+    memcpy(cert_hash, cert_data + offset, 32);
+    offset += 32;
+    
     // 有效性标志
-    is_valid = cert_data[sizeof(ImpCert) + 32];
-    // 撤销标志
-    is_revoked = cert_data[sizeof(ImpCert) + 32 + 1];
+    is_valid = cert_data[offset];
     
     // 提取证书有效期
     time_t start_time, end_time;
@@ -414,15 +451,36 @@ int handle_user_certificate(struct MHD_Connection *connection, const char *url) 
     
     // 转换证书数据为JSON
     struct json_object *response_obj = json_object_new_object();
+    
+    // 基本信息
+    json_object_object_add(response_obj, "version", json_object_new_int(cert.Version));
     json_object_object_add(response_obj, "serialNum", json_object_new_string((const char*)cert.SerialNum));
-    json_object_object_add(response_obj, "issuerID", json_object_new_string((const char*)cert.IssuerID));
-    json_object_object_add(response_obj, "subjectID", json_object_new_string((const char*)cert.SubjectID));
-    json_object_object_add(response_obj, "validFrom", json_object_new_int64((int64_t)start_time));
-    json_object_object_add(response_obj, "validTo", json_object_new_int64((int64_t)end_time));
+    char issuer_id[SUBJECT_ID_SIZE] = {0};  // 确保初始化为0
+    char subject_id[SUBJECT_ID_SIZE] = {0};  // 确保初始化为0
+    memcpy(issuer_id, cert.IssuerID, SUBJECT_ID_LEN);
+    memcpy(subject_id, cert.SubjectID, SUBJECT_ID_LEN);
+    json_object_object_add(response_obj, "issuerID", json_object_new_string(issuer_id));
+    json_object_object_add(response_obj, "subjectID", json_object_new_string(subject_id));
+    
+    // 转换时间为易读格式
+    char start_time_str[32] = {0};
+    char end_time_str[32] = {0};
+    struct tm *tm_info;
+    
+    tm_info = localtime(&start_time);
+    strftime(start_time_str, sizeof(start_time_str), "%Y-%m-%d %H:%M:%S", tm_info);
+    
+    tm_info = localtime(&end_time);
+    strftime(end_time_str, sizeof(end_time_str), "%Y-%m-%d %H:%M:%S", tm_info);
+    
+    json_object_object_add(response_obj, "validFrom", json_object_new_string(start_time_str));
+    json_object_object_add(response_obj, "validTo", json_object_new_string(end_time_str));
+    
     // 公钥（转为十六进制字符串）
     char *pubkey_hex = hex_encode(cert.PubKey, 33);
     json_object_object_add(response_obj, "pubKey", json_object_new_string(pubkey_hex));
     free(pubkey_hex);
+    
     // 证书哈希（转为十六进制字符串）
     char *hash_hex = hex_encode(cert_hash, 32);
     json_object_object_add(response_obj, "certHash", json_object_new_string(hash_hex));
@@ -430,7 +488,70 @@ int handle_user_certificate(struct MHD_Connection *connection, const char *url) 
     
     // 状态标志
     json_object_object_add(response_obj, "isValid", json_object_new_boolean(is_valid));
-    json_object_object_add(response_obj, "isRevoked", json_object_new_boolean(is_revoked));
+    
+    // 如果是V2版本证书，添加扩展信息
+    if (cert.Version == CERT_V2) {
+        struct json_object *ext_obj = json_object_new_object();
+        
+        // 证书用途
+        const char *usage_str = "未知";
+        switch (extensions.Usage) {
+            case USAGE_GENERAL:
+                usage_str = "通用证书";
+                break;
+            case USAGE_IDENTITY:
+                usage_str = "身份认证";
+                break;
+            default:
+                usage_str = "未知用途";
+                break;
+        }
+        json_object_object_add(ext_obj, "usage", json_object_new_string(usage_str));
+        
+        // 签名算法
+        const char *sign_alg_str = "未知";
+        switch (extensions.SignAlg) {
+            case SIGN_SM2:
+                sign_alg_str = "SM2";
+                break;
+            case SIGN_ECDSA:
+                sign_alg_str = "ECDSA";
+                break;
+            case SIGN_RSA:
+                sign_alg_str = "RSA";
+                break;
+            default:
+                sign_alg_str = "未知";
+                break;
+        }
+        json_object_object_add(ext_obj, "signAlg", json_object_new_string(sign_alg_str));
+        
+        // 哈希算法
+        const char *hash_alg_str = "未知";
+        switch (extensions.HashAlg) {
+            case HASH_SM3:
+                hash_alg_str = "SM3";
+                break;
+            case HASH_SHA256:
+                hash_alg_str = "SHA256";
+                break;
+            case HASH_SHA384:
+                hash_alg_str = "SHA384";
+                break;
+            default:
+                hash_alg_str = "未知";
+                break;
+        }
+        json_object_object_add(ext_obj, "hashAlg", json_object_new_string(hash_alg_str));
+        
+        // 额外信息
+        char extra_info[12] = {0};
+        memcpy(extra_info, extensions.ExtraInfo, 11);
+        json_object_object_add(ext_obj, "extraInfo", json_object_new_string(extra_info));
+        
+        // 将扩展信息添加到响应中
+        json_object_object_add(response_obj, "extensions", ext_obj);
+    }
     
     int ret = send_json_response(connection, MHD_HTTP_OK, response_obj, "GET, OPTIONS");
     json_object_put(response_obj);
@@ -816,7 +937,7 @@ int handle_verify_signature(struct MHD_Connection *connection, const char *uploa
 }
 
 // 处理撤销证书请求
-int handle_revoke_certificate(struct MHD_Connection *connection, const char *upload_data, size_t *upload_data_size) {
+int handle_revoke_cert(struct MHD_Connection *connection, const char *upload_data, size_t *upload_data_size) {
     static char *request_buffer = NULL;
     struct json_object *request_obj = NULL;
     
@@ -826,7 +947,6 @@ int handle_revoke_certificate(struct MHD_Connection *connection, const char *upl
     if (request_obj == NULL && request_buffer != NULL) {
         return MHD_YES;
     }
-
     if (request_obj == NULL) {
         return send_json_error(connection, MHD_HTTP_BAD_REQUEST, "缺少必要的请求数据");
     }
@@ -845,11 +965,11 @@ int handle_revoke_certificate(struct MHD_Connection *connection, const char *upl
     const char *user_id = json_object_get_string(user_id_obj);
     
     // 检查用户ID格式
-    if (strlen(user_id) != 8) {
+    if (strlen(user_id) != SUBJECT_ID_LEN) {
         json_object_put(request_obj);
         free(request_buffer);
         request_buffer = NULL;
-        return send_json_error(connection, MHD_HTTP_BAD_REQUEST, "用户ID必须是8个字符");
+        return send_json_error(connection, MHD_HTTP_BAD_REQUEST, "用户ID必须是4个字符");
     }
     
     // 请求撤销证书
@@ -1016,7 +1136,7 @@ enum MHD_Result request_handler(void *cls, struct MHD_Connection *connection,
         } else if (strcmp(url, "/api/keypair") == 0) {
             return handle_keypair_with_param(connection);
         } else if (strcmp(url, "/api/users/certificate") == 0) {
-            return handle_user_certificate(connection, url);
+            return handle_user_cert(connection, url);
         } else if (strcmp(url, "/api/cert-version") == 0) {
             return handle_cert_version(connection);
         }
@@ -1041,7 +1161,7 @@ enum MHD_Result request_handler(void *cls, struct MHD_Connection *connection,
         } else if (strcmp(url, "/api/verify-signature") == 0) {
             return handle_verify_signature(connection, upload_data, upload_data_size);
         } else if (strcmp(url, "/api/revoke-certificate") == 0) {
-            return handle_revoke_certificate(connection, upload_data, upload_data_size);
+            return handle_revoke_cert(connection, upload_data, upload_data_size);
         } else if (strcmp(url, "/api/set-cert-version") == 0) {
             return handle_set_cert_version(connection, upload_data, upload_data_size);
         }
@@ -1090,6 +1210,7 @@ void* ca_comm_thread_func(void* arg) {
                 pthread_mutex_lock(&users_mutex);
                 if (users) {
                     free(users);
+                    users = NULL; // 防止释放后使用指针
                 }
                 users = (UserInfo*)new_users;
                 user_count = new_user_count;
@@ -1107,7 +1228,7 @@ void* ca_comm_thread_func(void* arg) {
                 if (crl_entries) {
                     free(crl_entries);
                 }
-                crl_entries = (CRLEntry*)new_crl_entries;
+                crl_entries = (WebCRLEntry*)new_crl_entries;
                 crl_count = new_crl_count;
                 pthread_mutex_unlock(&crl_mutex);
             }

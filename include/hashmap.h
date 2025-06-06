@@ -27,6 +27,22 @@ typedef struct {
     void (*value_free)(void* value);
 } hashmap;
 
+// CRL条目结构体
+typedef struct {
+    time_t expire_time;      // 证书到期时间
+    time_t revoke_time;      // 证书撤销时间
+    char revoke_by[SUBJECT_ID_SIZE]; // 撤销人ID
+    unsigned char reason;    // 撤销原因代码
+} CRLEntry;
+
+typedef enum{
+    REASON_CERT_EXPIRED = 1,    // 证书过期
+    REASON_CERT_UPDATED = 2,    // 证书更新
+    REASON_KEY_LEAKED = 3,      // 密钥泄露
+    REASON_BUSINESS_END = 4,    // 业务终止
+    REASON_OTHER = 5            // 其他
+} RevokeReason;
+
 // 哈希表操作函数
 hashmap* hashmap_create(int size, 
                       int (*hash_func)(const void* key, int size),
@@ -44,6 +60,9 @@ int string_hash(const void* key, int size);
 bool string_compare(const void* key1, const void* key2);
 int binary_hash(const void* key, int size);
 bool binary_compare(const void* key1, const void* key2);
+
+// CRL条目辅助函数
+const char* get_revoke_reason_str(unsigned char reason);
 
 // userlist特定函数
 hashmap* ul_hashmap_create(int size);

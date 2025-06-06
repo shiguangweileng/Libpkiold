@@ -102,6 +102,8 @@ const refreshCRLList = () => {
   fetchCRLList()
 }
 
+
+
 onMounted(() => {
   fetchCRLList()
 })
@@ -173,6 +175,9 @@ onMounted(() => {
           <tr>
               <th>证书哈希</th>
               <th>到期时间</th>
+              <th>撤销时间</th>
+              <th>撤销人ID</th>
+              <th>撤销原因</th>
           </tr>
         </thead>
         <tbody>
@@ -181,6 +186,9 @@ onMounted(() => {
                 <div class="hash-display">{{ crl.certHash }}</div>
               </td>
               <td>{{ formatDate(crl.expireTime) }}</td>
+              <td>{{ formatDate(crl.revokeTime) }}</td>
+              <td>{{ crl.revokeBy }}</td>
+              <td>{{ crl.reason }}</td>
           </tr>
         </tbody>
       </table>
@@ -365,17 +373,22 @@ h1 {
 .crl-table-container {
   overflow-x: auto;
   flex-grow: 1;
+  max-width: 100%;
 }
 
 table {
   width: 100%;
   border-collapse: collapse;
+  table-layout: fixed;
+  min-width: 1200px; /* 确保哈希可以完整显示 */
+  max-width: 100%; /* 确保表格不会超出容器 */
 }
 
 th, td {
   padding: 14px 16px;
   text-align: left;
   border-bottom: 1px solid #e2e8f0;
+  word-wrap: break-word;
 }
 
 th {
@@ -386,21 +399,39 @@ th {
   top: 0;
 }
 
+/* 调整各列宽度 */
+th:first-child, td:first-child {
+  width: 40%; /* 减小证书哈希列宽度 */
+}
+
+th:nth-child(2), td:nth-child(2),
+th:nth-child(3), td:nth-child(3) {
+  width: 18%; /* 增加时间列宽度 */
+}
+
+th:nth-child(4), td:nth-child(4) {
+  width: 9%; /* 略微增加ID列宽度 */
+}
+
+th:nth-child(5), td:nth-child(5) {
+  width: 15%; /* 增加原因列宽度 */
+}
+
 tr:hover {
   background-color: #f8fafc;
 }
 
 .hash-cell {
-  display: flex;
-  align-items: center;
+  padding: 10px 16px;
 }
 
 .hash-display {
-  font-family: 'Segoe UI', -apple-system, BlinkMacSystemFont, 'Roboto', 'Helvetica Neue', Arial, sans-serif;
+  font-family: monospace, 'Segoe UI', -apple-system, BlinkMacSystemFont, sans-serif;
   color: #334155;
-  word-break: break-all;
+  white-space: nowrap;
   font-size: 14px;
-  letter-spacing: 0.2px;
+  letter-spacing: 0;
+  width: 100%;
 }
 
 .loading {

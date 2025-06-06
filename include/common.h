@@ -45,5 +45,7 @@ EXPORT int verify_key_pair_bytes(const EC_GROUP *group, const unsigned char *pub
 // 验证时间戳是否在合理范围内(当前时间前后TS_MAX_DIFF秒内)
 EXPORT int validate_timestamp(uint64_t timestamp);
 
+// 安全删除文件 - 通过多次随机数据覆写确保文件内容不可恢复
+EXPORT int secure_delete_file(const char *filename);
 
 #endif

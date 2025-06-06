@@ -43,7 +43,7 @@ int recv_message(int sock, uint8_t *cmd, void *data, uint16_t max_len);
 
 int request_user_list(int ca_socket, void **users, int *user_count);
 
-int request_user_certificate(int ca_socket, const char *user_id, unsigned char *cert_data, int max_size);
+int request_user_cert(int ca_socket, const char *user_id, unsigned char *cert_data, int max_size);
 
 int request_crl_list(int ca_socket, void **crl_entries, int *crl_count, int *base_v, int *removed_v);
 

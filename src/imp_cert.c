@@ -69,10 +69,6 @@ int getPu(const ImpCert *cert, EC_POINT *Pu) {
 
 // 释放证书资源
 void free_cert(ImpCert *cert) {
-    if (cert == NULL) {
-        return;
-    }
-    
     if (cert->Extensions) {
         free(cert->Extensions);
         cert->Extensions = NULL;
@@ -87,6 +83,7 @@ int set_cert(ImpCert *cert,
              const unsigned char *subject_id,
              time_t start_time,
              time_t end_time,
+             time_t issue_time,
              const EC_POINT *Pu,
              const ImpCertExt *extensions)
 {
@@ -111,6 +108,9 @@ int set_cert(ImpCert *cert,
     
     memcpy(cert->Validity, &start_time, sizeof(time_t));
     memcpy(cert->Validity + sizeof(time_t), &end_time, sizeof(time_t));
+    
+    // 设置颁发时间
+    memcpy(cert->IssueTime, &issue_time, sizeof(time_t));
     
     // 设置公钥
     if (!set_Pu2cert(cert->PubKey, Pu)) {
@@ -159,6 +159,7 @@ ASN1_SEQUENCE(ImpCertAsn1) = {
     ASN1_SIMPLE(ImpCertAsn1, subjectID, ASN1_UTF8STRING),
     ASN1_SIMPLE(ImpCertAsn1, startTime, ASN1_INTEGER),
     ASN1_SIMPLE(ImpCertAsn1, endTime, ASN1_INTEGER),
+    ASN1_SIMPLE(ImpCertAsn1, issueTime, ASN1_INTEGER),
     ASN1_SIMPLE(ImpCertAsn1, pubKey, ASN1_OCTET_STRING),
     ASN1_OPT(ImpCertAsn1, usage, ASN1_INTEGER),
     ASN1_OPT(ImpCertAsn1, signAlg, ASN1_INTEGER),
@@ -184,7 +185,7 @@ int save_cert(const ImpCert *cert, const char *filename)
     }
     
     // 填充ASN.1结构
-    time_t start_time, end_time;
+    time_t start_time, end_time, issue_time;
     int ret = 0;
     
     // 获取版本和对应的字段
@@ -198,6 +199,7 @@ int save_cert(const ImpCert *cert, const char *filename)
     // 提取时间戳
     memcpy(&start_time, validity, sizeof(time_t));
     memcpy(&end_time, validity + sizeof(time_t), sizeof(time_t));
+    memcpy(&issue_time, cert->IssueTime, sizeof(time_t));
     
     // 设置版本
     asn1_cert->version = ASN1_INTEGER_new();
@@ -220,9 +222,11 @@ int save_cert(const ImpCert *cert, const char *filename)
     // 设置时间字段
     asn1_cert->startTime = ASN1_INTEGER_new();
     asn1_cert->endTime = ASN1_INTEGER_new();
-    if (!asn1_cert->startTime || !asn1_cert->endTime || 
+    asn1_cert->issueTime = ASN1_INTEGER_new();
+    if (!asn1_cert->startTime || !asn1_cert->endTime || !asn1_cert->issueTime || 
         !ASN1_INTEGER_set_int64(asn1_cert->startTime, start_time) ||
-        !ASN1_INTEGER_set_int64(asn1_cert->endTime, end_time)) {
+        !ASN1_INTEGER_set_int64(asn1_cert->endTime, end_time) ||
+        !ASN1_INTEGER_set_int64(asn1_cert->issueTime, issue_time)) {
         goto cleanup;
     }
     
@@ -379,15 +383,19 @@ int load_cert(ImpCert *cert, const char *filename)
     }
     
     // 复制时间字段
-    time_t start_time = 0, end_time = 0;
+    time_t start_time = 0, end_time = 0, issue_time = 0;
     if (asn1_cert->startTime) {
         ASN1_INTEGER_get_int64(&start_time, asn1_cert->startTime);
     }
     if (asn1_cert->endTime) {
         ASN1_INTEGER_get_int64(&end_time, asn1_cert->endTime);
     }
+    if (asn1_cert->issueTime) {
+        ASN1_INTEGER_get_int64(&issue_time, asn1_cert->issueTime);
+    }
     memcpy(cert->Validity, &start_time, sizeof(time_t));
     memcpy(cert->Validity + sizeof(time_t), &end_time, sizeof(time_t));
+    memcpy(cert->IssueTime, &issue_time, sizeof(time_t));
     
     // 复制公钥
     if (asn1_cert->pubKey && ASN1_STRING_length(asn1_cert->pubKey) == 33) {
@@ -421,7 +429,7 @@ void print_cert_info(const ImpCert *cert) {
         return;
     }
     
-    time_t start_time, end_time;
+    time_t start_time, end_time, issue_time;
     unsigned char version = cert->Version;
     
     printf("---证书信息:\n");
@@ -444,7 +452,9 @@ void print_cert_info(const ImpCert *cert) {
     
     memcpy(&start_time, cert->Validity, sizeof(time_t));
     memcpy(&end_time, cert->Validity + sizeof(time_t), sizeof(time_t));
+    memcpy(&issue_time, cert->IssueTime, sizeof(time_t));
     
+    printf("---颁发时间: %s", ctime(&issue_time));
     printf("---生效时间: %s", ctime(&start_time));
     printf("---到期时间: %s", ctime(&end_time));
     printf("---部分公钥: ");

@@ -1,0 +1,34 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+# libpki项目结构
+
+libpki是一个轻量级PKI的C语言项目,主要实现了国密算法的证书管理功能。
+
+## 项目目录结构
+- `include/` - 包含所有头文件
+  - [common.h](mdc:include/common.h) - 通用定义和常量
+  - [gm_crypto.h](mdc:include/gm_crypto.h) - 国密算法接口
+  - [imp_cert.h](mdc:include/imp_cert.h) - 证书相关定义和功能，提供证书结构和证书操作函数
+  - [usercore.h](mdc:include/usercore.h) - 用户core相关功能接口,用于给测试程序使用,非user端代码
+  - [hashmap.h](mdc:include/hashmap.h) - 哈希表实现
+  - [crlmanager.h](mdc:include/crlmanager.h) - 证书撤销列表管理器
+  - [web_protocol.h](mdc:include/web_protocol.h) - ca和ca_web通过socket通信的协议和业务逻辑功能函数
+  
+- `src/` - 对应所有头文件的源代码实现
+- `server/` - 服务器相关代码
+  - `ca-server/` - CA服务器
+    - [ca.c](mdc:server/ca-server/ca.c) - CA的主程序,提供HTTP API接口处理用户请求,socket接口和ca_web进行前端交互
+    `ca-server/UserCerts` - 存放ca生成的证书,形如U001.crt
+    `ca-server/UserData` - 存放ca本地生成的用户公私钥文件,形如U001_pub.key,U001_priv.key
+    `ca-server/logs` - 日志文件存放目录
+  - `user-client/` - 用户客户端
+    - [user.c](mdc:server/user-client/user.c) - 用户客户端主程序
+    - [func_test.c](mdc:server/user-client/func_test.c) - 功能测试程序，自动测试各个功能模块
+    - [usercore.c](mdc:server/user-client/usercore.c) - usercore.h的实现,用于给测试程序使用
+
+- `webui/` - ca的后台管理界面,使用了vue3前端
+
+- [ca_web.c](mdc:webui/ca_web.c) - ca后端程序,与ca进行socket通信,与vue前端提供API接口

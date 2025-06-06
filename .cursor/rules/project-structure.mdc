@@ -1,33 +1,96 @@
 ---
 description: 
 globs: 
-alwaysApply: true
+alwaysApply: false
 ---
-# libpki项目结构
+# libpki项目架构
 
-libpki是一个轻量级PKI的C语言项目,主要实现了国密算法的证书管理功能。
+## 整体架构
 
-## 项目目录结构
-- `include/` - 包含所有头文件
-  - [common.h](mdc:include/common.h) - 通用定义和常量
-  - [gm_crypto.h](mdc:include/gm_crypto.h) - 国密算法接口
-  - [imp_cert.h](mdc:include/imp_cert.h) - 证书相关定义和功能，提供证书结构和证书操作函数
-  - [usercore.h](mdc:include/usercore.h) - 用户core相关功能接口,用于给测试程序使用,非user端代码
-  - [hashmap.h](mdc:include/hashmap.h) - 哈希表实现
-  - [crlmanager.h](mdc:include/crlmanager.h) - 证书撤销列表管理器
-  - [web_protocol.h](mdc:include/web_protocol.h) - ca和ca_web通过socket通信的协议和业务逻辑功能函数
-  
-- `src/` - 对应所有头文件的源代码实现
-- `server/` - 服务器相关代码
-  - `ca-server/` - CA服务器
-    - [ca.c](mdc:server/ca-server/ca.c) - CA的主程序,提供HTTP API接口处理用户请求,socket接口和ca_web进行前端交互
-    `ca-server/UserCerts` - 存放ca生成的证书,形如U0000001.crt
-    `ca-server/UserData` - 存放ca本地生成的用户公私钥文件,形如U0000001_pub.key,U0000001_priv.key
-  - `user-client/` - 用户客户端
-    - [user.c](mdc:server/user-client/user.c) - 用户客户端主程序
-    - [func_test.c](mdc:server/user-client/func_test.c) - 功能测试程序，自动测试各个功能模块
-    - [usercore.c](mdc:server/user-client/usercore.c) - usercore.h的实现,用于给测试程序使用
+libpki项目采用三层架构:
 
-- `webui/` - ca的后台管理界面,使用了vue3前端
+1. **前端层**: Vue3实现的对CA的web管理界面 (位于`webui`目录)
+2. **中间层**: web后端服务 (主体在`ca_web.c`文件)
+3. **核心层**: CA本体 (`server/ca-server/ca.c`文件)、User本体(`server/user-client/user.c`文件)
 
-- [ca_web.c](mdc:webui/ca_web.c) - ca后端程序,与ca进行socket通信,与vue前端提供API接口
+## 通信机制
+
+```
+Vue3前端 <--HTTP API--> ca_web后端 <--Socket通信--> CA <--HTTP API--> User
+```
+
+- **前端<-->ca_web**: 通过HTTP请求/响应进行通信 (端口8888)
+- **ca_web<-->CA**: 通过Socket进行通信 (端口8001),通信协议以及caweb发起的功能性请求函数封装在- [web_protocol.h](mdc:include/web_protocol.h) - [web_protocol.c](mdc:src/web_protocol.c) -
+- **CA<-->User**: 通过HTTP请求/响应进行通信（端口8080）
+
+数据流向
+
+1. 用户在Vue3前端界面操作，前端通过HTTP API请求ca_web后端服务
+2. ca_web将请求转换为特定协议，通过Socket发送给CA本体
+3. 返回给ca_web
+4. ca_web将结果转换为JSON格式，返回给前端
+
+## 主体功能
+
+### CA核心函数
+
+主要功能：证书注册、更新、撤销；CRL的更新维护；
+
+#### CA和User通信
+
+以handle_http开头的一系列函数，都是用来处理user发起的请求，然后CA进行响应
+
+- `handle_http_register()`处理证书注册
+- `handle_http_update()` 处理证书更新
+- `handle_http_revoke()` 处理证书撤销
+- `handle_http_message()` 处理签名消息完成身份认证
+- `handle_http_cert_status()` 处理证书状态查询
+- `handle_http_crl_update()` 处理uCRL列表增量更新请求
+
+#### CA本地操作功能
+
+以下功能由管理员在前端操作CA的本地功能
+
+- `local_generate_cert()` 本地生成某用户的证书
+- `local_update_cert()` 
+- `cleanup_expired_cert()` 清理CRL中已经过期的证书
+
+#### CA和ca_web通信
+
+以handle_web开头的一系列函数，都是用来处理ca_web发起的控制请求，并进行响应
+
+- `handle_web_get_users()` 处理获取用户列表
+- `handle_web_get_cert()` 处理获取某个用户的证书
+- `handle_web_get_crl()` 处理获取撤销列表
+- `handle_web_cleanup_certs()` 处理清理CRL过期证书
+- `handle_web_local_gen_cert()` 处理本地生成某用户的证书
+- `handle_web_local_upd_cert()` 处理本地更新用户证书
+- `handle_web_revoke_cert()` 处理撤销某用户的证书
+- `handle_web_set_cert_version()` 处理设置证书版本
+- `handle_web_get_cert_version()` 处理获取证书版本
+
+### ca_web
+
+### webui前端
+
+核心组件
+
+components/: UI组件目录
+
+- @UserList.vue: 用户列表组件，显示和管理用户证书
+
+- @CRLList.vue: 证书撤销列表组件，管理已撤销的证书
+
+- @CertVersionManager.vue: 证书版本管理组件
+
+- @Dialog.vue: 通用对话框组件
+
+- @LocalMode.vue: 本地模式组件
+
+- @MessageCenter.vue: 消息中心组件，展示系统通知和消息
+
+utils/: 工具函数目录
+
+- @config.js: 系统配置参数
+
+- @formatters.js: 数据格式化工具函数

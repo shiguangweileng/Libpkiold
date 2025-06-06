@@ -336,7 +336,7 @@ bool ul_hashmap_save(hashmap* map, const char* filename) {
 
 // 创建CRL哈希表
 hashmap* crl_hashmap_create(int size) {
-    // CRL中键是证书哈希，值为到期时间
+    // CRL中键是证书哈希，值为CRLEntry结构体
     return hashmap_create(size, binary_hash, binary_compare, free, free);
 }
 
@@ -380,21 +380,21 @@ hashmap* crl_hashmap_load(const char* filename) {
             break;
         }
         
-        // 读取值（到期时间）
-        time_t* expire_time = malloc(sizeof(time_t));
-        if (!expire_time) {
+        // 读取值（CRLEntry结构体）
+        CRLEntry* entry = malloc(sizeof(CRLEntry));
+        if (!entry) {
             free(cert_hash);
             break;
         }
         
-        if (fread(expire_time, sizeof(time_t), 1, file) != 1) {
+        if (fread(entry, sizeof(CRLEntry), 1, file) != 1) {
             free(cert_hash);
-            free(expire_time);
+            free(entry);
             break;
         }
         
         // 添加到哈希表
-        hashmap_put(map, cert_hash, expire_time, sizeof(time_t));
+        hashmap_put(map, cert_hash, entry, sizeof(CRLEntry));
     }
     
     fclose(file);
@@ -430,13 +430,8 @@ bool crl_hashmap_save(hashmap* map, const char* filename) {
                 return false;
             }
             
-            // 写入值（到期时间）
-            time_t expire_time = 0;
-            if (entry->value) {
-                expire_time = *((time_t*)entry->value);
-            }
-            
-            if (fwrite(&expire_time, sizeof(time_t), 1, file) != 1) {
+            // 写入值（CRLEntry结构体）
+            if (fwrite(entry->value, sizeof(CRLEntry), 1, file) != 1) {
                 fclose(file);
                 return false;
             }
@@ -447,4 +442,17 @@ bool crl_hashmap_save(hashmap* map, const char* filename) {
     
     fclose(file);
     return true;
+}
+
+// 获取CRL条目详细信息的辅助函数
+const char* get_revoke_reason_str(unsigned char reason) {
+    switch(reason) {
+        case 0: return "默认撤销";
+        case 1: return "证书过期";
+        case 2: return "证书更新";
+        case 3: return "密钥泄露";
+        case 4: return "业务终止";
+        case 5: return "其他";
+        default: return "未知原因";
+    }
 }

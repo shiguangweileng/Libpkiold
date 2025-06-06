@@ -10,7 +10,7 @@ all: ca user test web
 
 ca:
 	@echo "正在编译CA服务器..."
-	$(CC) server/ca-server/ca.c $(SRC_FILES) $(CFLAGS) -lmicrohttpd -o server/ca-server/ca
+	$(CC) server/ca-server/ca.c $(SRC_FILES) $(CFLAGS) -lmicrohttpd -lzlog -o server/ca-server/ca
 	@echo "CA服务器编译成功！"
 
 user:

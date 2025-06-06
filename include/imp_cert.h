@@ -54,6 +54,7 @@ typedef struct {
     unsigned char IssuerID[4];          // 颁发者ID
     unsigned char SubjectID[4];         // 主体ID
     unsigned char Validity[16];         // 有效期: 前8字节开始时间，后8字节结束时间
+    unsigned char IssueTime[8];         // 颁发时间: 8字节时间戳
     unsigned char PubKey[33];           // 公钥
     ImpCertExt *Extensions;             // 扩展信息，V1为NULL，V2为扩展对象
 } ImpCert;
@@ -66,6 +67,7 @@ typedef struct ImpCertAsn1_st {
     ASN1_UTF8STRING *subjectID;
     ASN1_INTEGER *startTime;
     ASN1_INTEGER *endTime;
+    ASN1_INTEGER *issueTime;           // 添加颁发时间ASN.1字段
     ASN1_OCTET_STRING *pubKey;
     ASN1_INTEGER *usage;
     ASN1_INTEGER *signAlg;
@@ -84,6 +86,7 @@ EXPORT int set_cert(ImpCert *cert,
                     const unsigned char *subject_id,
                     time_t start_time,
                     time_t end_time,
+                    time_t issue_time,
                     const EC_POINT *Pu,
                     const ImpCertExt *extensions);
 

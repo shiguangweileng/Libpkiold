@@ -505,6 +505,14 @@ int request_registration(const char *user_id) {
     
     free(response_data);
     
+    // 验证证书颁发时间戳
+    time_t issue_time;
+    memcpy(&issue_time, cert.IssueTime, sizeof(time_t));
+    if (!validate_timestamp((uint64_t)issue_time)) {
+        printf("验证证书颁发时间戳失败\n");
+        goto cleanup;
+    }
+    
     //--------step3:用户端生成最终的公私钥对-------------
     // 获取隐式证书中的Pu
     Pu = EC_POINT_new(group);
@@ -528,6 +536,7 @@ int request_registration(const char *user_id) {
     // 计算最终私钥d_u=e×Ku+r (mod n)
     unsigned char d_u[SM2_PRI_MAX_SIZE];
     calculate_r(d_u, e, Ku, r, order);
+    print_hex("用户公钥Qu", Qu, SM2_PUB_MAX_SIZE);
     print_hex("用户私钥d_u", d_u, SM2_PRI_MAX_SIZE);
     
     // 验证密钥对
@@ -609,22 +618,28 @@ int request_cert_update(const char *user_id) {
     int ru_len = EC_POINT_point2oct(group, Ru, POINT_CONVERSION_UNCOMPRESSED, 
                                      Ru_bytes, SM2_PUB_MAX_SIZE, NULL);
     
-    // 准备要签名的数据：ID + Ru（先ID后Ru）
-    unsigned char sign_data[SUBJECT_ID_LEN + SM2_PUB_MAX_SIZE];
+    // 获取当前时间戳
+    time_t now = time(NULL);
+    uint64_t timestamp = (uint64_t)now;
+    uint64_t ts_network = htobe64(timestamp);  // 转换为网络字节序
+    
+    // 准备要签名的数据：ID + Ru + 时间戳（先ID后Ru后时间戳）
+    unsigned char sign_data[SUBJECT_ID_LEN + SM2_PUB_MAX_SIZE + 8];
     memcpy(sign_data, user_id, SUBJECT_ID_LEN);
     memcpy(sign_data + SUBJECT_ID_LEN, Ru_bytes, ru_len);
+    memcpy(sign_data + SUBJECT_ID_LEN + ru_len, &ts_network, 8);
     
     // 用私钥对数据签名
     unsigned char signature[64];
-    if (!sm2_sign(signature, sign_data, SUBJECT_ID_LEN + ru_len, priv_key)) {
+    if (!sm2_sign(signature, sign_data, SUBJECT_ID_LEN + ru_len + 8, priv_key)) {
         printf("签名失败\n");
         goto cleanup;
     }
     
-    // 准备发送的完整数据：ID + Ru + 签名
-    unsigned char send_data[SUBJECT_ID_LEN + SM2_PUB_MAX_SIZE + 64];
-    memcpy(send_data, sign_data, SUBJECT_ID_LEN + ru_len);
-    memcpy(send_data + SUBJECT_ID_LEN + ru_len, signature, 64);
+    // 准备发送的完整数据：ID + Ru + 时间戳 + 签名
+    unsigned char send_data[SUBJECT_ID_LEN + SM2_PUB_MAX_SIZE + 8 + 64];
+    memcpy(send_data, sign_data, SUBJECT_ID_LEN + ru_len + 8);
+    memcpy(send_data + SUBJECT_ID_LEN + ru_len + 8, signature, 64);
     
     // 使用HTTP发送更新请求
     unsigned char *response_data = NULL;
@@ -633,7 +648,7 @@ int request_cert_update(const char *user_id) {
     // 构建URL
     char url[100];
     sprintf(url, "http://%s:%d/update", CA_IP, CA_PORT);
-    if (!http_send_request(url, send_data, SUBJECT_ID_LEN + ru_len + 64, &response_data, &response_len)) {
+    if (!http_send_request(url, send_data, SUBJECT_ID_LEN + ru_len + 8 + 64, &response_data, &response_len)) {
         printf("发送更新请求失败\n");
         goto cleanup;
     }
@@ -699,6 +714,8 @@ int request_cert_update(const char *user_id) {
     // 计算最终私钥d_u=e×Ku+r (mod n)
     unsigned char d_u[SM2_PRI_MAX_SIZE];
     calculate_r(d_u, e, Ku, r, order);
+    print_hex("用户公钥Qu", Qu, SM2_PUB_MAX_SIZE);
+    print_hex("用户私钥d_u", d_u, SM2_PRI_MAX_SIZE);
 
     // 验证密钥对
     if(!verify_key_pair_bytes(group, Qu, d_u)) {
@@ -831,11 +848,6 @@ int send_signed_message(const char *user_id, const char *message) {
 
 // 使用HTTP请求撤销证书
 int request_cert_revoke(const char *user_id) {
-    // 检查证书和私钥是否已加载
-    if (!has_cert) {
-        printf("错误：找不到用户证书\n");
-        return 0;
-    }
     
     // 获取当前时间戳
     time_t now = time(NULL);
@@ -917,24 +929,24 @@ int request_cert_revoke(const char *user_id) {
     
     free(response_data);
     
-    printf("证书撤销成功！正在清理本地证书文件...\n");
+    printf("证书撤销成功！正在安全删除本地证书文件...\n");
     
     // 删除本地证书文件
-    char cert_filename[100];
+    char cert_filename[20];
     sprintf(cert_filename, "%s.crt", user_id);
     remove(cert_filename);
     
-    // 删除本地私钥文件
-    char priv_key_filename[100];
+    // 安全删除本地私钥文件
+    char priv_key_filename[20];
     sprintf(priv_key_filename, "%s_priv.key", user_id);
-    remove(priv_key_filename);
+    secure_delete_file(priv_key_filename);
     
     // 删除本地公钥文件
-    char pub_key_filename[100];
+    char pub_key_filename[20];
     sprintf(pub_key_filename, "%s_pub.key", user_id);
     remove(pub_key_filename);
     
-    printf("本地证书文件清理完成\n");
+    printf("本地证书文件安全清理完成\n");
     
     return 1;
 }
