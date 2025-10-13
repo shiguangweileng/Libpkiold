@@ -5,45 +5,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-
-// 全局SM2参数
-EC_GROUP *group = NULL;
-BIGNUM *order = NULL;
-
-int sm2_params_init() {
-    // 创建SM2椭圆曲线组
-    group = EC_GROUP_new_by_curve_name(1172);
-    if (!group) {
-        printf("初始化SM2曲线参数失败！\n");
-        return 0;
-    }
-    
-    order = BN_new();
-    if (!order || !EC_GROUP_get_order(group, order, NULL)) {
-        printf("获取SM2曲线阶失败！\n");
-        sm2_params_cleanup();
-        return 0;
-    }
-    
-    return 1;
-}
-
-void sm2_params_cleanup() {
-    if (order) {
-        BN_free(order);
-        order = NULL;
-    }
-    
-    if (group) {
-        EC_GROUP_free(group);
-        group = NULL;
-    }
-}
+#include <stdio.h>
 
 int CA_init(unsigned char *pub, unsigned char *priv)
 {
     // SM2椭圆曲线参数初始化
-    if(!sm2_params_init()){
+    if(!global_params_init()){
         printf("SM2参数初始化失败！\n");
         return -1;
     }
@@ -73,7 +40,7 @@ int CA_init(unsigned char *pub, unsigned char *priv)
 int User_init(unsigned char *pub){
 
     // SM2椭圆曲线参数初始化
-    if(!sm2_params_init()){
+    if(!global_params_init()){
         printf("SM2参数初始化失败！\n");
         return -1;
     }
@@ -90,10 +57,9 @@ int User_init(unsigned char *pub){
     return 1;
 }
 
-
 void print_hex(const char *name, const unsigned char *data, int data_len)
 {
-    printf("%s: (%d字节) ", name, data_len);
+    printf("%s(%d字节) ", name, data_len);
     for (int i = 0; i < data_len; i++)
     {
         printf("%02x", data[i]);
@@ -359,5 +325,4 @@ cleanup:
     
     return ret;
 }
-
 

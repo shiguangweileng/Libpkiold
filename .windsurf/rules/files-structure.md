@@ -1,8 +1,7 @@
 ---
-description: 
-globs: 
-alwaysApply: true
+trigger: always_on
 ---
+
 # libpki项目结构
 
 libpki是一个轻量级PKI的C语言项目,主要实现了国密算法的证书管理功能。
@@ -26,8 +25,6 @@ libpki是一个轻量级PKI的C语言项目,主要实现了国密算法的证书
     `ca-server/logs` - 日志文件存放目录
   - `user-client/` - 用户客户端
     - [user.c](mdc:server/user-client/user.c) - 用户客户端主程序
-    - [func_test.c](mdc:server/user-client/func_test.c) - 功能测试程序，自动测试各个功能模块
-    - [usercore.c](mdc:server/user-client/usercore.c) - usercore.h的实现,用于给测试程序使用
 
 - `webui/` - ca的后台管理界面,使用了vue3前端
 

@@ -5,6 +5,9 @@
 #include <stdbool.h>
 #include "imp_cert.h"
 
+// 动态扩容阈值
+#define HASHMAP_LOAD_FACTOR 0.75
+
 // 通用哈希表节点结构
 typedef struct hashmap_entry {
     void* key;                     // 键可以是任何类型的指针
@@ -43,7 +46,28 @@ typedef enum{
     REASON_OTHER = 5            // 其他
 } RevokeReason;
 
-// 哈希表操作函数
+// ================= 会话密钥定义 =================
+#define SESSION_KEY_LEN 16      // 128bit 会话密钥长度
+#define SESSION_VALID_SECS 3600 // 默认有效期 1 小时
+
+typedef struct {
+    unsigned char key[SESSION_KEY_LEN]; // 会话密钥
+    time_t create_time;                 // 创建时间
+    time_t expire_time;                 // 失效时间
+} SessionKey;
+
+// 会话密钥哈希表相关函数
+hashmap* session_hashmap_create(int size);
+bool session_key_put(hashmap* map, const char* id, const unsigned char* key);
+SessionKey* session_key_get(hashmap* map, const char* id);
+bool session_key_is_valid(const SessionKey* sk);
+
+// 持久化
+hashmap* session_hashmap_load(const char* filename);
+bool session_hashmap_save(hashmap* map, const char* filename);
+void session_key_cleanup(hashmap* map);
+
+// ================= 哈希表操作函数 ================= 
 hashmap* hashmap_create(int size, 
                       int (*hash_func)(const void* key, int size),
                       bool (*key_compare)(const void* key1, const void* key2),
@@ -53,7 +77,8 @@ void hashmap_destroy(hashmap* map);
 bool hashmap_exists(hashmap* map, const void* key);
 void* hashmap_get(hashmap* map, const void* key);
 bool hashmap_put(hashmap* map, void* key, void* value, int value_size);
-bool hashmap_remove(hashmap* map, const void* key);
+bool hashmap_remove(hashmap *map, const void *key);
+bool hashmap_resize(hashmap* map, int new_size);
 
 // 字符串键、二进制数据的哈希和比较函数
 int string_hash(const void* key, int size);

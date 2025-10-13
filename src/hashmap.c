@@ -3,15 +3,16 @@
 #include <string.h>
 #include "hashmap.h"
 #include <time.h>
+#include <unistd.h>
+
 // 字符串键的哈希函数
 int string_hash(const void* key, int size) {
-    const char* str = (const char*)key;
-    int hash = 0;
+    const unsigned char* str = (const unsigned char*)key;
+    unsigned long hash = 5381; // djb2 基础值
     while (*str) {
-        hash = (hash * 31 + *str) % size;
-        str++;
+        hash = ((hash << 5) + hash) + *str++; // hash * 33 + c
     }
-    return hash;
+    return (int)(hash % (unsigned long)size);
 }
 
 // 字符串键的比较函数
@@ -22,11 +23,11 @@ bool string_compare(const void* key1, const void* key2) {
 // 二进制数据的哈希函数
 int binary_hash(const void* key, int size) {
     const unsigned char* bytes = (const unsigned char*)key;
-    int hash = 0;
+    unsigned long hash = 5381;
     for (int i = 0; i < CERT_HASH_SIZE; i++) {
-        hash = (hash * 31 + bytes[i]) % size;
+        hash = ((hash << 5) + hash) + bytes[i];
     }
-    return hash;
+    return (int)(hash % (unsigned long)size);
 }
 
 // 二进制数据的比较函数
@@ -141,9 +142,14 @@ bool hashmap_put(hashmap* map, void* key, void* value, int value_size) {
             if (map->value_free) map->value_free(entry->value);
             
             if (value && value_size > 0) {
-                entry->value = malloc(value_size);
-                if (!entry->value) return false;
-                memcpy(entry->value, value, value_size);
+                void *tmp = malloc(value_size);
+                if (!tmp) {
+                    // 恢复原值指针为空，避免悬挂
+                    entry->value = NULL;
+                    return false;
+                }
+                memcpy(tmp, value, value_size);
+                entry->value = tmp;
             } else {
                 entry->value = value; // 直接存储指针或NULL
             }
@@ -170,7 +176,7 @@ bool hashmap_put(hashmap* map, void* key, void* value, int value_size) {
     if (value && value_size > 0) {
         new_entry->value = malloc(value_size);
         if (!new_entry->value) {
-            if (map->key_free == string_key_free) free(new_entry->key);
+            if (map->key_free) map->key_free(new_entry->key); // 统一释放策略
             free(new_entry);
             return false;
         }
@@ -189,6 +195,11 @@ bool hashmap_put(hashmap* map, void* key, void* value, int value_size) {
     }
     
     map->count++;
+
+    // 超过负载因子自动扩容
+    if ((double)map->count / map->size > HASHMAP_LOAD_FACTOR) {
+        hashmap_resize(map, map->size * 2 + 1); // 扩容为 2n+1，减少碰撞
+    }
     return true;
 }
 
@@ -219,6 +230,31 @@ bool hashmap_remove(hashmap* map, const void* key) {
     }
     
     return false;  // 未找到要删除的键
+}
+
+/**
+ * 调整哈希表大小并重新散列
+ */
+bool hashmap_resize(hashmap* map, int new_size) {
+    if (!map || new_size <= 0) return false;
+    hashmap_entry** new_entries = (hashmap_entry**)calloc(new_size, sizeof(hashmap_entry*));
+    if (!new_entries) return false;
+
+    for (int i = 0; i < map->size; i++) {
+        hashmap_entry* entry = map->entries[i];
+        while (entry) {
+            hashmap_entry* next = entry->next;
+            int new_index = map->hash_func(entry->key, new_size);
+            entry->next = new_entries[new_index];
+            new_entries[new_index] = entry;
+            entry = next;
+        }
+    }
+
+    free(map->entries);
+    map->entries = new_entries;
+    map->size = new_size;
+    return true;
 }
 
 // ======= 用户列表特定函数 =======
@@ -454,5 +490,127 @@ const char* get_revoke_reason_str(unsigned char reason) {
         case 4: return "业务终止";
         case 5: return "其他";
         default: return "未知原因";
+    }
+}
+
+// ======= 会话密钥特定函数 =======
+
+// 从二进制文件加载会话密钥哈希表
+hashmap* session_hashmap_load(const char* filename) {
+    FILE* file = fopen(filename, "rb");
+    if (!file) {
+        // 文件不存在，创建新的哈希表
+        return session_hashmap_create(256);
+    }
+    int size;
+    if (fread(&size, sizeof(int), 1, file) != 1) {
+        fclose(file);
+        return session_hashmap_create(256);
+    }
+    int count;
+    if (fread(&count, sizeof(int), 1, file) != 1) {
+        fclose(file);
+        return session_hashmap_create(256);
+    }
+
+    hashmap* map = session_hashmap_create(size);
+    if (!map) { fclose(file); return NULL; }
+
+    for (int i = 0; i < count; i++) {
+        char* key = malloc(SUBJECT_ID_LEN + 1);
+        if (!key) break;
+        if (fread(key, 1, SUBJECT_ID_LEN, file) != SUBJECT_ID_LEN) { free(key); break; }
+        key[SUBJECT_ID_LEN] = '\0';
+
+        SessionKey* sk = malloc(sizeof(SessionKey));
+        if (!sk) { free(key); break; }
+        if (fread(sk, sizeof(SessionKey), 1, file) != 1) { free(key); free(sk); break; }
+
+        hashmap_put(map, key, sk, sizeof(SessionKey));
+    }
+    fclose(file);
+    return map;
+}
+
+// 保存会话密钥哈希表到二进制文件
+bool session_hashmap_save(hashmap* map, const char* filename) {
+    if (!map || !filename) return false;
+    FILE* file = fopen(filename, "wb");
+    if (!file) return false;
+
+    if (fwrite(&map->size, sizeof(int), 1, file) != 1) { fclose(file); return false; }
+    if (fwrite(&map->count, sizeof(int), 1, file) != 1) { fclose(file); return false; }
+
+    // 遍历表写入数据
+    for (int i = 0; i < map->size; i++) {
+        hashmap_entry* entry = map->entries[i];
+        while (entry) {
+            // 键: SUBJECT_ID_LEN 字节
+            fwrite(entry->key, 1, SUBJECT_ID_LEN, file);
+            // 值: SessionKey
+            fwrite(entry->value, sizeof(SessionKey), 1, file);
+            entry = entry->next;
+        }
+    }
+    fclose(file);
+    return true;
+}
+
+// 创建会话密钥哈希表
+hashmap* session_hashmap_create(int size) {
+    return hashmap_create(size, string_hash, string_compare, free, free);
+}
+
+// 插入或更新会话密钥
+bool session_key_put(hashmap* map, const char* id, const unsigned char* key) {
+    if (!map || !id || !key) return false;
+    SessionKey* session_key = malloc(sizeof(SessionKey));
+    if (!session_key) return false;
+    memcpy(session_key->key, key, SESSION_KEY_LEN);
+    session_key->create_time = time(NULL);
+    session_key->expire_time = session_key->create_time + SESSION_VALID_SECS;
+
+    char* id_dup = strdup(id);
+    if (!id_dup) { free(session_key); return false; }
+    return hashmap_put(map, id_dup, session_key, sizeof(SessionKey));
+}
+
+// 获取会话密钥
+SessionKey* session_key_get(hashmap* map, const char* id) {
+    if (!map || !id) return NULL;
+    return (SessionKey*)hashmap_get(map, id);
+}
+
+// 检查会话密钥是否在有效期内
+bool session_key_is_valid(const SessionKey* sk) {
+    if (!sk) return false;
+    return time(NULL) < sk->expire_time;
+}
+
+// 清理过期会话密钥
+void session_key_cleanup(hashmap* map) {
+    if (!map) return;
+    time_t now = time(NULL);
+    for (int i = 0; i < map->size; i++) {
+        hashmap_entry* entry = map->entries[i];
+        hashmap_entry* prev = NULL;
+        while (entry) {
+            SessionKey* sk = (SessionKey*)entry->value;
+            if (sk && sk->expire_time <= now) {
+                // 移除节点
+                if (prev) prev->next = entry->next;
+                else map->entries[i] = entry->next;
+
+                if (map->key_free) map->key_free(entry->key);
+                if (map->value_free) map->value_free(entry->value);
+                hashmap_entry* to_del = entry;
+                entry = entry->next;
+                free(to_del);
+                map->count--;
+            } else {
+                prev = entry;
+                entry = entry->next;
+            }
+        }
     }
 }

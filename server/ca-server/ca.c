@@ -25,6 +25,7 @@
 #define USERLIST_FILE "UserList.dat"     // 用户列表文件
 #define SERIAL_NUM_FILE "SerialNum.txt"  // 序列号持久化文件
 #define CRL_MANAGER_FILE "CRLManager.dat" // CRL管理器文件
+#define SESSION_MAP_FILE "SessionKeys.dat"
 
 #define LOG_JSON "{\"operator\":\"%s\",\"operation\":\"%s\"}"
 
@@ -35,10 +36,11 @@
 //ca核心数据
 unsigned char d_ca[SM2_PRI_MAX_SIZE];
 unsigned char Q_ca[SM2_PUB_MAX_SIZE];
-unsigned char cert_version = CERT_V2;    // 当前使用的证书版本，默认为V1
+unsigned char cert_version = CERT_V1;    // 当前使用的证书版本，默认为V1
 
 hashmap* user_map = NULL;           // 存储用户ID和证书哈希
 hashmap* crl_map = NULL;            // 存储被撤销的证书哈希和条目结构体
+hashmap* session_map = NULL;        // 会话密钥表
 CRLManager* crl_manager = NULL;     // CA端的CRL管理器
 unsigned int current_serial_num = 1;  // 当前证书序列号，默认从1开始
 struct MHD_Daemon *http_daemon = NULL;   // HTTP服务器实例
@@ -89,6 +91,7 @@ enum MHD_Result handle_http_revoke(struct MHD_Connection *connection, const char
 enum MHD_Result handle_http_message(struct MHD_Connection *connection, const char *upload_data, unsigned long upload_data_size);
 enum MHD_Result handle_http_cert_status(struct MHD_Connection *connection, const char *upload_data, unsigned long upload_data_size);
 enum MHD_Result handle_http_crl_update(struct MHD_Connection *connection, const char *upload_data, unsigned long upload_data_size);
+enum MHD_Result handle_http_key_agreement(struct MHD_Connection *connection, const char *upload_data, unsigned long upload_data_size);
 
 // CA本地功能
 int local_generate_cert(const char *subject_id);
@@ -144,9 +147,13 @@ int main() {
     crl_map = crl_hashmap_load(CRL_FILE);
     crl_manager = CRLManager_load_from_file(CRL_MANAGER_FILE);
     
+    /* 初始化会话密钥表 */
+    session_map = session_hashmap_load(SESSION_MAP_FILE);
+    if (!session_map) session_map = session_hashmap_create(256);
+    
     if(dzlog != 0 || user_map == NULL || crl_map == NULL || crl_manager == NULL){
         printf("初始化失败！\n");
-        sm2_params_cleanup();
+        global_params_cleanup();
         hashmap_destroy(user_map);
         hashmap_destroy(crl_map);
         CRLManager_free(crl_manager);
@@ -156,12 +163,18 @@ int main() {
     run_online_mode();
     
     hashmap_destroy(user_map);
+    /* 保存并销毁会话密钥表 */
+    if (session_map) {
+        session_hashmap_save(session_map, SESSION_MAP_FILE);
+        hashmap_destroy(session_map);
+    }
+    
     hashmap_destroy(crl_map);
     if (crl_manager) {
         CRLManager_save_to_file(crl_manager, CRL_MANAGER_FILE);
         CRLManager_free(crl_manager);
     }
-    sm2_params_cleanup();
+    global_params_cleanup();
     printf("OK！\n");
     return 0;
 }
@@ -226,7 +239,7 @@ int local_generate_cert(const char *subject_id) {
 
     cert = (ImpCert *)malloc(sizeof(ImpCert));
     time_t current_time = time(NULL);
-    time_t expire_time = current_time + 60*60; // 1h有效期
+    time_t expire_time = current_time + 60*60*24; // 1天有效期
     if(!set_cert(cert, 
               cert_version,
               (unsigned char *)serial_num,
@@ -387,7 +400,7 @@ int local_update_cert(const char *subject_id) {
     
     // 设置证书有效期
     time_t current_time = time(NULL);
-    time_t expire_time = current_time + 60*60; // 1小时有效期
+    time_t expire_time = current_time + 60*60*24; // 1天有效期
     
     if(!set_cert(new_cert, 
              cert_version,
@@ -1218,6 +1231,8 @@ enum MHD_Result http_request_handler(void *cls, struct MHD_Connection *connectio
         ret = handle_http_cert_status(connection, (const char *)con_info->upload_data, con_info->upload_data_size);
     } else if (strcmp(url, "/crl_update") == 0) {
         ret = handle_http_crl_update(connection, (const char *)con_info->upload_data, con_info->upload_data_size);
+    } else if (strcmp(url, "/key_agreement") == 0) {
+        ret = handle_http_key_agreement(connection, (const char *)con_info->upload_data, con_info->upload_data_size);
     } else {
         // 不支持的路径
         ret = send_http_error_response(connection, MHD_HTTP_NOT_FOUND);
@@ -1297,10 +1312,13 @@ enum MHD_Result handle_http_register(struct MHD_Connection *connection, const ch
         printf("计算Pu失败\n");
         goto cleanup;
     }
+    char *Pu_hex = EC_POINT_point2hex(group, Pu, POINT_CONVERSION_COMPRESSED, NULL);
+    // printf("Pu: %s\n", Pu_hex);
+    OPENSSL_free(Pu_hex);
+    // print_hex("Q_ca", Q_ca, SM2_PUB_MAX_SIZE);
 
     // 生成新的证书序列号
     serial_num = generate_serial_num();
-    printf("生成新证书，序列号: %s\n", serial_num);
 
     // 如果是V2证书，需要准备扩展信息
     if (cert_version == CERT_V2) {
@@ -1324,7 +1342,7 @@ enum MHD_Result handle_http_register(struct MHD_Connection *connection, const ch
     cert = (ImpCert *)malloc(sizeof(ImpCert));
     
     time_t current_time = time(NULL);
-    time_t expire_time = current_time + 60*60;
+    time_t expire_time = current_time + 60*60*24;
     if(!set_cert(cert, 
               cert_version,
               (unsigned char *)serial_num,
@@ -1356,7 +1374,7 @@ enum MHD_Result handle_http_register(struct MHD_Connection *connection, const ch
     // 计算部分私钥r=e×k+d_ca (mod n)
     unsigned char r[SM2_PRI_MAX_SIZE];
     calculate_r(r, cert_hash, k, d_ca, order);
-    print_hex("部分私钥r", r, SM2_PRI_MAX_SIZE);
+    // print_hex("部分私钥r", r, SM2_PRI_MAX_SIZE);
     
     // 准备响应数据
     if (cert_version == CERT_V1) {
@@ -1390,8 +1408,8 @@ enum MHD_Result handle_http_register(struct MHD_Connection *connection, const ch
         goto cleanup;
     }
     
-    printf("用户 '%s' 成功注册并保存到UserList\n", subject_id);
-    printf("--------------------------------\n");
+    // printf("用户 '%s' 成功注册并保存到UserList\n", subject_id);
+    // printf("--------------------------------\n");
     dzlog_info(LOG_JSON, subject_id, "证书注册成功");
 
     // 发送HTTP成功响应
@@ -1552,11 +1570,10 @@ enum MHD_Result handle_http_update(struct MHD_Connection *connection, const char
     // 生成隐式证书
     new_cert = (ImpCert *)malloc(sizeof(ImpCert));
     char* new_serial_num = generate_serial_num();
-    printf("生成新证书，序列号: %s\n", new_serial_num);
     
     // 设置证书有效期
     time_t current_time = time(NULL);
-    time_t expire_time = current_time + 60*60; // 1小时有效期
+    time_t expire_time = current_time + 60*60*24; // 1天有效期
     
     if(!set_cert(new_cert, 
              cert_version,
@@ -1572,7 +1589,6 @@ enum MHD_Result handle_http_update(struct MHD_Connection *connection, const char
     // 计算新隐式证书的哈希值
     unsigned char new_cert_hash[32];
     calc_cert_hash(new_cert, new_cert_hash);
-    print_hex("新隐式证书哈希值e", new_cert_hash, 32);
 
     // 获取旧证书的到期时间
     time_t old_expire_time;
@@ -1808,127 +1824,56 @@ cleanup:
 
 // 处理消息请求
 enum MHD_Result handle_http_message(struct MHD_Connection *connection, const char *upload_data, unsigned long upload_data_size) {
-    char *message = NULL;
-    EC_POINT *Pu = NULL;
-    unsigned char Qu[SM2_PUB_MAX_SIZE];
-    unsigned char cert_hash[32];
-    enum MHD_Result ret = MHD_NO;
-    ImpCert *cert = NULL;
-    
-    // 检查数据长度
-    if (!upload_data || upload_data_size < 2) {
-        printf("接收到的数据长度错误\n");
+    /* 数据包格式: [4字节SenderID] [16字节IV] [2字节密文长度] [密文] */
+    if (!upload_data || upload_data_size < SUBJECT_ID_LEN + SM4_IV_SIZE + 2) {
         return send_http_error_response(connection, MHD_HTTP_BAD_REQUEST);
     }
-    
-    // 解析消息长度（网络字节序）
-    uint16_t message_len = (upload_data[0] << 8) | upload_data[1];
-    
-    // 计算证书基本结构大小（不包含Extensions指针）
-    int cert_base_size = sizeof(ImpCert) - sizeof(ImpCertExt*);
-    
-    // 验证数据长度是否足够包含基础数据
-    if (upload_data_size < 2 + message_len + 64 + cert_base_size) {
-        printf("接收到的数据长度不足，无法解析完整消息\n");
+
+    const unsigned char *ptr = (const unsigned char*)upload_data;
+
+    char sender_id[SUBJECT_ID_LEN + 1] = {0};
+    memcpy(sender_id, ptr, SUBJECT_ID_LEN);
+    sender_id[SUBJECT_ID_LEN] = '\0';
+    ptr += SUBJECT_ID_LEN;
+
+    unsigned char iv[SM4_IV_SIZE];
+    memcpy(iv, ptr, SM4_IV_SIZE);
+    ptr += SM4_IV_SIZE;
+
+    uint16_t cipher_len = ((uint16_t)ptr[0] << 8) | ptr[1];
+    ptr += 2;
+
+    if (upload_data_size < SUBJECT_ID_LEN + SM4_IV_SIZE + 2 + cipher_len) {
         return send_http_error_response(connection, MHD_HTTP_BAD_REQUEST);
     }
-    
-    // 提取消息内容
-    message = (char *)malloc(message_len + 1);  // +1 用于null结尾
-    if (!message) {
-        printf("内存分配失败\n");
+
+    const unsigned char *ciphertext = ptr;
+
+    // 获取会话密钥
+    SessionKey *session_key = session_key_get(session_map, sender_id);
+    if (!session_key || !session_key_is_valid(session_key)) {
+        printf("会话密钥无效或不存在: %s\n", sender_id);
+        return send_http_error_response(connection, MHD_HTTP_FORBIDDEN);
+    }
+
+    int plain_buf_len = cipher_len;
+    unsigned char *plaintext = (unsigned char*)malloc(plain_buf_len + 1);
+    int plain_len = 0;
+    if (!plaintext) {
         return send_http_error_response(connection, MHD_HTTP_INTERNAL_SERVER_ERROR);
     }
-    memcpy(message, upload_data + 2, message_len);
-    message[message_len] = '\0';
-    
-    // 提取签名
-    unsigned char signature[64];
-    memcpy(signature, upload_data + 2 + message_len, 64);
-    
-    // 提取证书基本信息（不包含Extensions指针的部分）
-    cert = (ImpCert *)malloc(sizeof(ImpCert));
-    
-    memcpy(cert, upload_data + 2 + message_len + 64, cert_base_size);
-    cert->Extensions = NULL; // 先设置为NULL，如果是V2证书再单独处理
-    
-    // 从证书中提取发送者ID和版本
-    char sender_id[SUBJECT_ID_SIZE] = {0};
-    memcpy(sender_id, cert->SubjectID, SUBJECT_ID_LEN);
-    unsigned char version = cert->Version;
-    printf("收到 %s 的消息(HTTP)，证书版本：V%d\n", sender_id, version);
-    
-    // 处理V2证书的扩展信息
-    if (version == CERT_V2) {
-        // 检查数据长度是否足够包含扩展信息
-        if (upload_data_size < 2 + message_len + 64 + cert_base_size + sizeof(ImpCertExt)) {
-            printf("接收到的数据长度不足，无法解析V2证书扩展信息\n");
-            goto cleanup;
-        }
-        
-        // 分配并提取扩展信息
-        cert->Extensions = (ImpCertExt *)malloc(sizeof(ImpCertExt));
-        if (!cert->Extensions) {
-            printf("扩展信息内存分配失败\n");
-            goto cleanup;
-        }
-        
-        // memset(cert.Extensions, 0, sizeof(ImpCertExt)); // 确保清零
-        memcpy(cert->Extensions, upload_data + 2 + message_len + 64 + cert_base_size, sizeof(ImpCertExt));
+    print_hex("ciphertext:", ciphertext, cipher_len);
+    if (!sm4_decrypt(plaintext, &plain_len, ciphertext, cipher_len, session_key->key, iv)) {
+        free(plaintext);
+        return send_http_error_response(connection, MHD_HTTP_INTERNAL_SERVER_ERROR);
     }
-    
-    // 验证证书有效期
-    if (!validate_cert(cert)) {
-        printf("拒绝消息：证书已过期\n");
-        ret = send_http_error_response(connection, MHD_HTTP_UNAUTHORIZED);
-        goto cleanup;
-    }
-    
-    // 计算证书哈希
-    calc_cert_hash(cert, cert_hash);
-    
-    // 检查证书是否在CRL中
-    if (check_cert_in_crl(cert_hash)) {
-        printf("拒绝消息：证书已被撤销\n");
-        ret = send_http_error_response(connection, MHD_HTTP_UNAUTHORIZED);
-        goto cleanup;
-    }
-    
-    // 从证书恢复用户公钥
-    Pu = EC_POINT_new(group);
-    if (!Pu || !getPu(cert, Pu)) {
-        printf("获取Pu失败\n");
-        ret = send_http_error_response(connection, MHD_HTTP_INTERNAL_SERVER_ERROR);
-        goto cleanup;
-    }
-    
-    // 重构用户公钥 Qu = e*Pu + Q_ca
-    if (!rec_pubkey(Qu, cert_hash, Pu, Q_ca)) {
-        printf("重构用户公钥失败\n");
-        ret = send_http_error_response(connection, MHD_HTTP_INTERNAL_SERVER_ERROR);
-        goto cleanup;
-    }
-    
-    // 验证消息签名
-    if (sm2_verify(signature, (const unsigned char *)message, message_len, Qu)) {
-        printf("签名验证成功！消息内容：%s\n", message);
-        printf("--------------------------------\n");
-        
-        // 构造成功响应
-        ret = send_http_error_response(connection, MHD_HTTP_OK);
-    } else {
-        printf("签名验证失败，拒绝消息\n");
-        ret = send_http_error_response(connection, MHD_HTTP_UNAUTHORIZED);
-    }
-
-cleanup:
-    if (message) free(message);
-    if (Pu) EC_POINT_free(Pu);
-    if (cert) free_cert(cert);
-    return ret ? ret : send_http_error_response(connection, MHD_HTTP_INTERNAL_SERVER_ERROR);
+    plaintext[plain_len] = '\0';
+    // print_hex("plaintext:", plaintext, plain_len);
+    printf("收到来自 %s 的加密消息: %s\n", sender_id, plaintext);
+    if (plaintext) free(plaintext);
+    printf("OK\n");
+    return send_http_error_response(connection, MHD_HTTP_OK);
 }
-
-
 
 // 启动HTTP服务器
 int start_http_server() {
@@ -1979,7 +1924,7 @@ enum MHD_Result send_http_success_response(struct MHD_Connection *connection,
     return ret;
 }
 
-// 处理证书状态查询的HTTP请求
+// 处理证书状态查询的HTTP请求，1表示有效，0表示无效
 enum MHD_Result handle_http_cert_status(struct MHD_Connection *connection, const char *upload_data, unsigned long upload_data_size) {
     if (!upload_data || upload_data_size != CERT_HASH_SIZE) {
         printf("接收到的数据长度错误，无法处理证书状态查询\n");
@@ -2023,7 +1968,7 @@ enum MHD_Result handle_http_cert_status(struct MHD_Connection *connection, const
     memcpy(resp_data + 1, &ts_network, 8);
     memcpy(resp_data + 1 + 8, signature, 64);
     
-    printf("已发送证书状态响应\n");
+    // printf("已发送证书状态响应\n");
     
     // 发送响应
     return send_http_success_response(connection, resp_data, 1 + 8 + 64);
@@ -2166,4 +2111,381 @@ void handle_web_get_cert_version(int client_socket) {
     unsigned char response = cert_version;
     send_message(client_socket, WEB_CMD_CERT_VERSION_DATA, &response, 1);
 }
+
+enum MHD_Result handle_http_key_agreement(struct MHD_Connection *connection, const char *upload_data, unsigned long upload_data_size)
+{
+    enum MHD_Result ret = MHD_NO;
+    char subject_id[SUBJECT_ID_SIZE] = {0};
+    ImpCert *a_cert = NULL;
+    ImpCertExt *extensions = NULL;
+    EC_POINT *Pu = NULL;
+    EC_POINT *PA = NULL;
+    unsigned char cert_hash[32] = {0};
+    unsigned char Qu[SM2_PUB_MAX_SIZE] = {0};
+    
+    // 检查数据长度是否足够
+    if (!upload_data || upload_data_size < sizeof(ImpCert) - sizeof(ImpCertExt*) + SM2_PUB_MAX_SIZE + 8 + 64) {
+        printf("接收到的数据长度错误\n");
+        return send_http_error_response(connection, MHD_HTTP_BAD_REQUEST);
+    }
+
+    //==================步骤一：接收用户A的密钥协商请求====================
+    // 提取基本证书信息（不包括扩展指针）
+    a_cert = (ImpCert *)malloc(sizeof(ImpCert));
+    if (!a_cert) {
+        printf("内存分配失败\n");
+        ret = send_http_error_response(connection, MHD_HTTP_INTERNAL_SERVER_ERROR);
+        goto cleanup;
+    }
+    int cert_base_size = sizeof(ImpCert) - sizeof(ImpCertExt*);
+    memcpy(a_cert, upload_data, cert_base_size);
+    a_cert->Extensions = NULL;  // 先设置为NULL
+    
+    // 获取用户ID
+    memcpy(subject_id, a_cert->SubjectID, SUBJECT_ID_LEN);
+    // printf("%s---密钥协商请求(HTTP)\n", subject_id);
+    dzlog_info(LOG_JSON, subject_id, "密钥协商请求");
+    
+    int offset = cert_base_size;
+    int ext_size = 0;
+    
+    // 处理扩展信息（如果是V2证书）
+    if (a_cert->Version == CERT_V2) {
+        if (upload_data_size < offset + sizeof(ImpCertExt) + SM2_PUB_MAX_SIZE + 8 + 64) {
+            printf("接收到的数据长度错误，无法解析V2证书扩展信息\n");
+            ret = send_http_error_response(connection, MHD_HTTP_BAD_REQUEST);
+            goto cleanup;
+        }
+        
+        extensions = (ImpCertExt *)malloc(sizeof(ImpCertExt));
+        if (!extensions) {
+            printf("扩展信息内存分配失败\n");
+            ret = send_http_error_response(connection, MHD_HTTP_INTERNAL_SERVER_ERROR);
+            goto cleanup;
+        }
+        
+        memcpy(extensions, upload_data + offset, sizeof(ImpCertExt));
+        a_cert->Extensions = extensions;
+        ext_size = sizeof(ImpCertExt);
+        offset += ext_size;
+    }
+    
+    // 提取PA
+    PA = EC_POINT_new(group);
+    if (!PA || !EC_POINT_oct2point(group, PA, (const unsigned char *)upload_data + offset, 
+                           SM2_PUB_MAX_SIZE, NULL)) {
+        printf("解析PA失败\n");
+        ret = send_http_error_response(connection, MHD_HTTP_BAD_REQUEST);
+        goto cleanup;
+    }
+    
+    offset += SM2_PUB_MAX_SIZE;
+    
+    // 提取时间戳
+    uint64_t timestamp_A;
+    memcpy(&timestamp_A, upload_data + offset, 8);
+    timestamp_A = be64toh(timestamp_A);  // 网络字节序转为主机字节序
+    
+    // ====================步骤二：验证用户A的合法性====================
+    if (!validate_timestamp(timestamp_A)) {
+        printf("密钥协商请求中的时间戳无效\n");
+        ret = send_http_error_response(connection, MHD_HTTP_BAD_REQUEST);
+        goto cleanup;
+    }
+    
+    // 查询证书有效性
+    if (!validate_cert(a_cert)) {
+        printf("证书已过期，拒绝密钥协商请求\n");
+        ret = send_http_error_response(connection, MHD_HTTP_BAD_REQUEST);
+        goto cleanup;
+    }
+    
+    // 计算证书哈希值
+    calc_cert_hash(a_cert, cert_hash);
+    
+    // 查询证书是否在撤销列表中
+    if (check_cert_in_crl(cert_hash)) {
+        printf("证书已被撤销，拒绝密钥协商请求\n");
+        ret = send_http_error_response(connection, MHD_HTTP_BAD_REQUEST);
+        goto cleanup;
+    }
+    
+
+    // 重构用户公钥 Qu = e*Pu + Q_ca
+    Pu = EC_POINT_new(group);
+    getPu(a_cert, Pu);
+    if (!rec_pubkey(Qu, cert_hash, Pu, Q_ca)) {
+        printf("重构用户公钥失败\n");
+        ret = send_http_error_response(connection, MHD_HTTP_INTERNAL_SERVER_ERROR);
+        goto cleanup;
+    }
+    
+    // 提取签名
+    unsigned char sig_A[64];
+    memcpy(sig_A, upload_data + offset + 8, 64);
+    
+    // 验证签名
+    int ma_size = cert_base_size + ext_size + SM2_PUB_MAX_SIZE + 8;
+    if (!sm2_verify(sig_A, (const unsigned char *)upload_data, ma_size, Qu)) {
+        printf("签名验证失败，拒绝密钥协商请求\n");
+        ret = send_http_error_response(connection, MHD_HTTP_BAD_REQUEST);
+        goto cleanup;
+    }
+    
+    
+    // ====================步骤三: 继续密钥协商过程====================
+    BIGNUM *sB = NULL;
+    EC_POINT *PB = NULL;
+    EC_POINT *PAB = NULL;
+    BIGNUM *xu = NULL;
+    BIGNUM *yu = NULL;
+    BIGNUM *pa_x = NULL;
+    BIGNUM *pa_y = NULL;
+    BIGNUM *pb_x = NULL;
+    BIGNUM *pb_y = NULL;
+    ImpCert *b_cert = NULL;
+    unsigned char *response_data = NULL;
+    unsigned char *mb_data = NULL;
+    int response_len = 0;
+    int mb_size = 0;
+    int pb_len = 0;
+    
+    // (1) 生成随机整数sB，计算PB=sB·G
+    sB = BN_new();
+    BN_rand_range(sB, order);
+    PB = EC_POINT_new(group);
+    if (!PB || !EC_POINT_mul(group, PB, sB, NULL, NULL, NULL)) {
+        printf("计算PB=sB·G失败\n");
+        ret = send_http_error_response(connection, MHD_HTTP_INTERNAL_SERVER_ERROR);
+        goto cleanup;
+    }
+    
+    // 生成时间戳
+    time_t now = time(NULL);
+    uint64_t timestamp = (uint64_t)now;
+    uint64_t ts_network = htobe64(timestamp);  // 转换为网络字节序
+
+    // 这里用CA模拟加载用户B的信息
+    unsigned char b_privkey[SM2_PRI_MAX_SIZE];
+    FILE *priv_file = fopen("U002_priv.key", "rb");
+    if (!priv_file) {
+        printf("打开用户B的私钥文件失败\n");
+        ret = send_http_error_response(connection, MHD_HTTP_INTERNAL_SERVER_ERROR);
+        goto cleanup;
+    }
+    fread(b_privkey, 1, SM2_PRI_MAX_SIZE, priv_file);
+    fclose(priv_file);
+
+    // 打印测试B的公钥
+    unsigned char b_pubkey[SM2_PUB_MAX_SIZE];
+    FILE *pub_file = fopen("U002_pub.key", "rb");
+    if (!pub_file) {
+        printf("打开用户B的公钥文件失败\n");
+        ret = send_http_error_response(connection, MHD_HTTP_INTERNAL_SERVER_ERROR);
+        goto cleanup;
+    }
+    fread(b_pubkey, 1, SM2_PUB_MAX_SIZE, pub_file);
+    fclose(pub_file);
+    // print_hex("b_pubkey", b_pubkey, SM2_PUB_MAX_SIZE);
+
+    b_cert = (ImpCert *)malloc(sizeof(ImpCert));
+    load_cert(b_cert, "U002.crt");
+    unsigned char b_cert_hash[32];
+    calc_cert_hash(b_cert, b_cert_hash);
+    // print_hex("b_cert_hash", b_cert_hash, 32);
+    // EC_POINT *tPu = EC_POINT_new(group);
+    // getPu(b_cert, tPu);
+    // // 重构用户公钥 Qu = e*Pu + Q_ca
+    // unsigned char tPu_bytes[SM2_PUB_MAX_SIZE];
+    // EC_POINT_point2oct(group, tPu, POINT_CONVERSION_UNCOMPRESSED, tPu_bytes, SM2_PUB_MAX_SIZE, NULL);
+    // print_hex("Pu", tPu_bytes, SM2_PUB_MAX_SIZE);
+    // unsigned char tQu[SM2_PUB_MAX_SIZE];
+    // if(!rec_pubkey(tQu, b_cert_hash, tPu, Q_ca)) {
+    //     printf("重构用户公钥失败\n");
+    //     goto cleanup;
+    // }
+    // print_hex("Qu", tQu, SM2_PUB_MAX_SIZE);
+    
+
+    ext_size = 0;
+    // 如果是V2证书，添加扩展信息大小
+    if (b_cert->Version == CERT_V2 && b_cert->Extensions) {
+        ext_size = sizeof(ImpCertExt);
+    }
+    // 将PB转换为字节数组
+    unsigned char PB_bytes[SM2_PUB_MAX_SIZE];
+    pb_len = EC_POINT_point2oct(group, PB, POINT_CONVERSION_UNCOMPRESSED, 
+                               PB_bytes, SM2_PUB_MAX_SIZE, NULL);
+    
+    // 构造认证消息MB={CertB,PB,T}
+    mb_size = cert_base_size + ext_size + pb_len + 8;  // 证书 + 公钥PB + 时间戳
+    mb_data = (unsigned char *)malloc(mb_size);
+    if (!mb_data) {
+        printf("内存分配失败\n");
+        ret = send_http_error_response(connection, MHD_HTTP_INTERNAL_SERVER_ERROR);
+        goto cleanup;
+    }
+    
+    // 填充MB数据
+    offset = 0;
+    
+    // 填充证书基本信息
+    memcpy(mb_data + offset, b_cert, cert_base_size);
+    offset += cert_base_size;
+    
+    // 如果是V2证书，填充扩展信息
+    if (b_cert->Version == CERT_V2 && b_cert->Extensions) {
+        memcpy(mb_data + offset, b_cert->Extensions, sizeof(ImpCertExt));
+        offset += sizeof(ImpCertExt);
+    }
+    
+    // 填充PB
+    memcpy(mb_data + offset, PB_bytes, pb_len);
+    offset += pb_len;
+    
+    // 填充时间戳
+    memcpy(mb_data + offset, &ts_network, 8);
+    
+    // 用私钥对MB进行签名
+    unsigned char sig_B[64];
+    if (!sm2_sign(sig_B, mb_data, mb_size, b_privkey)) {
+        printf("签名失败\n");
+        ret = send_http_error_response(connection, MHD_HTTP_INTERNAL_SERVER_ERROR);
+        goto cleanup;
+    }
+    
+    // (2) 计算共享点PAB=PA·sB
+    PAB = EC_POINT_new(group);
+    if (!PAB || !EC_POINT_mul(group, PAB, NULL, PA, sB, NULL)) {
+        printf("计算共享点PAB=PA·sB失败\n");
+        ret = send_http_error_response(connection, MHD_HTTP_INTERNAL_SERVER_ERROR);
+        goto cleanup;
+    }
+    
+    // 提取共享点坐标
+    xu = BN_new();
+    yu = BN_new();
+    if (!xu || !yu || !EC_POINT_get_affine_coordinates(group, PAB, xu, yu, NULL)) {
+        printf("获取共享点坐标失败\n");
+        ret = send_http_error_response(connection, MHD_HTTP_INTERNAL_SERVER_ERROR);
+        goto cleanup;
+    }
+    
+    // 将坐标转换为字节数组
+    unsigned char xu_bytes[32] = {0};
+    unsigned char yu_bytes[32] = {0};
+    BN_bn2bin(xu, xu_bytes + (32 - BN_num_bytes(xu)));
+    BN_bn2bin(yu, yu_bytes + (32 - BN_num_bytes(yu)));
+
+    /* -------- 生成并保存会话密钥 -------- */
+    {
+        unsigned char Z[32 + 32 + 4 + 4];
+        memcpy(Z, xu_bytes, 32);
+        memcpy(Z + 32, yu_bytes, 32);
+        memcpy(Z + 64, a_cert->SubjectID, 4);          /* ID_A = 请求方ID */
+        memcpy(Z + 68, CA_ID, 4);         /* ID_B */
+        
+        unsigned char sess_key[SESSION_KEY_LEN];
+        if (!sm3_kdf(Z, sizeof(Z), sess_key, SESSION_KEY_LEN)) {
+            printf("SM3 KDF失败\n");
+            ret = send_http_error_response(connection, MHD_HTTP_INTERNAL_SERVER_ERROR);
+            goto cleanup;
+        }
+        char id_str[5];
+        memcpy(id_str, a_cert->SubjectID, 4);
+        id_str[4] = '\0';
+        session_key_put(session_map, id_str, sess_key);
+        SessionKey *t_key = session_key_get(session_map, id_str);
+        printf("和%s的会话密钥为：", id_str);
+        if (t_key) print_hex("key", t_key->key, SESSION_KEY_LEN);
+    }
+    
+    // 计算SM3(xu)
+    unsigned char sm3_xu[32];
+    sm3_hash(xu_bytes, 32, sm3_xu);
+    
+    // (3) 计算会话密钥确认值 XB
+    // XB=SM3(0x02||yu||SM3(xu)||PAx||PAy||PBx||PBy)
+    unsigned char xb_data[1 + 32 + 32 + 32*4];
+    unsigned char PA_x_bytes[32] = {0};
+    unsigned char PA_y_bytes[32] = {0};
+    unsigned char PB_x_bytes[32] = {0};
+    unsigned char PB_y_bytes[32] = {0};
+    
+    // 提取PA的坐标
+    pa_x = BN_new();
+    pa_y = BN_new();
+    if (!pa_x || !pa_y || !EC_POINT_get_affine_coordinates(group, PA, pa_x, pa_y, NULL)) {
+        printf("获取PA坐标失败\n");
+        ret = send_http_error_response(connection, MHD_HTTP_INTERNAL_SERVER_ERROR);
+        goto cleanup;
+    }
+    BN_bn2bin(pa_x, PA_x_bytes + (32 - BN_num_bytes(pa_x)));
+    BN_bn2bin(pa_y, PA_y_bytes + (32 - BN_num_bytes(pa_y)));
+    
+    // 提取PB的坐标
+    pb_x = BN_new();
+    pb_y = BN_new();
+    if (!pb_x || !pb_y || !EC_POINT_get_affine_coordinates(group, PB, pb_x, pb_y, NULL)) {
+        printf("获取PB坐标失败\n");
+        ret = send_http_error_response(connection, MHD_HTTP_INTERNAL_SERVER_ERROR);
+        goto cleanup;
+    }
+    BN_bn2bin(pb_x, PB_x_bytes + (32 - BN_num_bytes(pb_x)));
+    BN_bn2bin(pb_y, PB_y_bytes + (32 - BN_num_bytes(pb_y)));
+    
+    // 构造XB计算数据
+    xb_data[0] = 0x02;  // 常量0x02
+    memcpy(xb_data + 1, yu_bytes, 32);  // yu
+    memcpy(xb_data + 1 + 32, sm3_xu, 32);  // SM3(xu)
+    memcpy(xb_data + 1 + 32 + 32, PA_x_bytes, 32);  // PAx
+    memcpy(xb_data + 1 + 32 + 32 + 32, PA_y_bytes, 32);  // PAy
+    memcpy(xb_data + 1 + 32 + 32 + 32 + 32, PB_x_bytes, 32);  // PBx
+    memcpy(xb_data + 1 + 32 + 32 + 32 + 32 + 32, PB_y_bytes, 32);  // PBy
+
+    // 计算XB
+    unsigned char XB[32];
+    sm3_hash(xb_data, sizeof(xb_data), XB);
+    
+    // (4) 构造响应数据: MB + 签名 + XB
+    response_len = mb_size + 64 + 32;  // MB大小 + 签名大小 + XB大小
+    response_data = (unsigned char *)malloc(response_len);
+    if (!response_data) {
+        printf("内存分配失败\n");
+        ret = send_http_error_response(connection, MHD_HTTP_INTERNAL_SERVER_ERROR);
+        goto cleanup;
+    }
+    
+    // 复制MB数据
+    memcpy(response_data, mb_data, mb_size);
+    // 复制签名
+    memcpy(response_data + mb_size, sig_B, 64);
+    // 复制XB
+    memcpy(response_data + mb_size + 64, XB, 32);
+    
+    // 发送响应
+    ret = send_http_success_response(connection, response_data, response_len);
+    response_data = NULL; // 防止二次释放
+    
+cleanup:
+    if (PA) EC_POINT_free(PA);
+    if (PB) EC_POINT_free(PB);
+    if (Pu) EC_POINT_free(Pu);
+    if (PAB) EC_POINT_free(PAB);
+    if (sB) BN_free(sB);
+    if (xu) BN_free(xu);
+    if (yu) BN_free(yu);
+    if (pa_x) BN_free(pa_x);
+    if (pa_y) BN_free(pa_y);
+    if (pb_x) BN_free(pb_x);
+    if (pb_y) BN_free(pb_y);
+    if (a_cert) free_cert(a_cert);
+    if (b_cert) free_cert(b_cert);
+    if (mb_data) free(mb_data);
+    if (response_data) free(response_data);
+
+    
+    return ret;
+}
+
 

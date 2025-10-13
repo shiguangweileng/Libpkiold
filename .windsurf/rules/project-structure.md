@@ -1,7 +1,7 @@
 ---
+trigger: model_decision
 description: 
 globs: 
-alwaysApply: false
 ---
 # libpki项目架构
 

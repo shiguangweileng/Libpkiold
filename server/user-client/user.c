@@ -5,6 +5,7 @@
 #include <sys/time.h>
 #include <sys/socket.h>
 #include <curl/curl.h>
+#include <openssl/rand.h>
 #include "common.h"
 #include "gm_crypto.h"
 #include "imp_cert.h"
@@ -12,6 +13,7 @@
 #include "crlmanager.h"
 
 #define CRL_MANAGER_FILE "CRLManager.dat"
+#define SESSION_MAP_FILE "SessionKeys.dat"
 #define MAX_MESSAGE_SIZE 1024 // 最大消息长度
 #define NETWORK_TIMEOUT 1000  // 网络超时时间（毫秒）
 
@@ -23,12 +25,14 @@
 static char CA_IP[16] = "127.0.0.1";
 
 // 存储相关信息的全局变量
-ImpCert loaded_cert;
-hashmap* local_crl = NULL;                  // 本地CRL哈希表，只存储证书哈希值
+ImpCert *loaded_cert = NULL;
+hashmap *local_crl = NULL; // 本地CRL哈希表，只存储证书哈希值
+hashmap* session_map = NULL; /* 会话密钥表 */
 CRLManager* crl_manager = NULL;
 unsigned char priv_key[SM2_PRI_MAX_SIZE];
 unsigned char pub_key[SM2_PUB_MAX_SIZE];
 unsigned char Q_ca[SM2_PUB_MAX_SIZE];
+char user_id[SUBJECT_ID_SIZE] = {0};
 int has_cert = 0;
 
 // CRL相关函数
@@ -40,11 +44,23 @@ int online_csp(const unsigned char *cert_hash);
 int local_csp(const unsigned char *cert_hash);
 
 // 用户操作
+
+// ----------------- 会话密钥保存函数 -------------------
+void save_session_map(void) {
+    if (session_map) {
+        session_hashmap_save(session_map, SESSION_MAP_FILE);
+        hashmap_destroy(session_map);
+        session_map = NULL;
+    }
+}
+
 int load_keys_and_cert(const char *user_id);
 int request_registration(const char *user_id);
 int request_cert_update(const char *user_id);
 int request_cert_revoke(const char *user_id);
-int send_signed_message(const char *user_id, const char *message);
+void save_session_map(void);
+int send_encrypt_message(const char *sender_id, const char *server_ip, int port, const char *plaintext);
+int request_key_agreement();
 
 // HTTP通信相关函数
 typedef struct {
@@ -143,22 +159,26 @@ int http_send_request(const char *url, const unsigned char *data, int data_len,
 
 int main() {
     char server_ip[16] = {0};
-    char user_id[SUBJECT_ID_SIZE] = {0};
     int choice = 0;
     int running = 1; // 控制主循环
     int result = 0;
     struct timeval start_time, end_time;
-    
+    /* 初始化会话密钥表 */
+    session_map = session_hashmap_load(SESSION_MAP_FILE);
+    if (!session_map) session_map = session_hashmap_create(256);
+
+    /* 程序退出时保存会话密钥 */
+    atexit(save_session_map);
     if (!User_init(Q_ca)) {
         printf("加载CA公钥失败！\n");
-        sm2_params_cleanup();
+        global_params_cleanup();
         return -1;
     }
     
     // 初始化CRL管理器和哈希表
     if (!init_crl_manager()) {
         printf("初始化CRL管理器失败！\n");
-        sm2_params_cleanup();
+        global_params_cleanup();
         return -1;
     }
     
@@ -166,7 +186,7 @@ int main() {
     printf("请输入服务器IP地址(输入1使用127.0.0.1): ");
     if (scanf("%15s", server_ip) != 1) {
         printf("IP地址输入错误\n");
-        sm2_params_cleanup();
+        global_params_cleanup();
         return -1;
     }
     
@@ -203,13 +223,14 @@ int main() {
             printf("\n用户 [%s] 请选择操作:\n", user_id);
             printf("1. 注册新证书\n");
             printf("2. 更新现有证书\n");
-            printf("3. 发送签名消息\n");
+            printf("3. 发送加密消息\n");
             printf("4. 撤销证书\n");
             printf("5. 同步CRL\n");
             printf("6. 证书状态查询\n");
             printf("7. 证书状态比对(在线+本地)\n");
-            printf("8. 切换用户\n");
-            printf("9. 退出程序\n");
+            printf("8. 密钥协商\n");
+            printf("9. 切换用户\n");
+            printf("0. 退出程序\n");
 
             printf("请输入选择: ");
             if (scanf("%d", &choice) != 1) {
@@ -219,10 +240,10 @@ int main() {
             }
             
             // 检查是否要切换用户或退出
-            if (choice == 8) {
+            if (choice == 9) {
                 user_session = 0; // 退出当前用户会话，返回到用户ID输入
                 continue;
-            } else if (choice == 9) {
+            } else if (choice == 0) {
                 user_session = 0;
                 running = 0; // 退出程序
                 continue;
@@ -252,32 +273,25 @@ int main() {
                     }
                     break;
                     
-                case 3: // 发送消息
-                    if (!has_cert) {
-                        printf("错误：需要先有证书才能发送消息\n");
-                        continue;
-                    }
-                    clear_input_buffer();
-                    
-                    // 获取要发送的消息
+                case 3:{ // 发送加密消息
+                    char *peer_id = "U002";
                     char message[MAX_MESSAGE_SIZE] = {0};
+                    clear_input_buffer();
                     printf("请输入要发送的消息: ");
                     if (fgets(message, MAX_MESSAGE_SIZE, stdin) == NULL) {
                         printf("消息输入错误\n");
-                        continue;
+                        break;
                     }
-                    
-                    // 移除消息末尾的换行符
-                    int len = strlen(message);
-                    if (len > 0 && message[len-1] == '\n') {
-                        message[len-1] = '\0';
+                    // 去除尾部换行
+                    size_t msg_len = strlen(message);
+                    if (msg_len > 0 && message[msg_len - 1] == '\n') {
+                        message[msg_len - 1] = '\0';
                     }
-                    
-                    // 在用户完成输入后再开始计时
+                    // char *message = "Hello, World!";
                     gettimeofday(&start_time, NULL); // 记录开始时间
-                    result = send_signed_message(user_id, message);
+                    result = send_encrypt_message(peer_id, server_ip, CA_PORT, message);
                     break;
-                    
+                }
                 case 4: // 撤销证书
                     if (!has_cert) {
                         printf("错误：需要先有证书才能撤销\n");
@@ -296,7 +310,7 @@ int main() {
                     break;
                     
                 case 6: // 证书状态查询
-                    {
+                {
                     unsigned char cert_hash[CERT_HASH_SIZE];
                     clear_input_buffer();
                     if (!parse_hex_hash(cert_hash, CERT_HASH_SIZE)) {
@@ -308,10 +322,10 @@ int main() {
                     printf("online_csp:%s\n", online_status ? "有效" : "无效（已撤销）");
                     result = 1;
                     break;
-                    }
+                }
                     
                 case 7: // 证书状态比对
-                    {
+                {
                     unsigned char cert_hash2[CERT_HASH_SIZE];
                     clear_input_buffer();
                     
@@ -329,7 +343,12 @@ int main() {
                     printf("local_csp:%s\n", local_status ? "有效" : "无效（已撤销）");
                     result = 1;
                     break;
-                    }
+                }
+                    
+                case 8: // 密钥协商
+                    gettimeofday(&start_time, NULL); // 记录开始时间
+                    result = request_key_agreement();
+                    break;
                     
                 default:
                     printf("无效的选择\n");
@@ -344,10 +363,10 @@ int main() {
                 
                 const char* operation_names[] = {
                     "未知操作", "注册证书", "更新证书", "发送消息", 
-                    "撤销证书", "同步证书撤销列表", "查询证书状态", "证书状态比对"
+                    "撤销证书", "同步证书撤销列表", "查询证书状态", "证书状态比对", "密钥协商"
                 };
                 
-                if (choice >= 1 && choice <= 7) {
+                if (choice >= 1 && choice <= 9) {
                     printf("%s的时间开销: %.2f ms\n", operation_names[choice], elapsed_ms);
                 }
             }
@@ -366,7 +385,7 @@ int main() {
     if (local_crl) {
         hashmap_destroy(local_crl);
     }
-    sm2_params_cleanup();
+    global_params_cleanup();
     return 0;
 }
 
@@ -387,8 +406,18 @@ int load_keys_and_cert(const char *user_id) {
         return 0;
     }
     
+    // 为loaded_cert分配内存
+    if (!loaded_cert) {
+        loaded_cert = (ImpCert *)malloc(sizeof(ImpCert));
+        if (!loaded_cert) {
+            printf("内存分配失败\n");
+            fclose(cert_file);
+            return 0;
+        }
+        memset(loaded_cert, 0, sizeof(ImpCert));
+    }
     // 加载证书
-    if (!load_cert(&loaded_cert, cert_filename)) {
+    if (!load_cert(loaded_cert, cert_filename)) {
         printf("无法加载证书文件: %s\n", cert_filename);
         fclose(cert_file);
         return 0;
@@ -476,7 +505,7 @@ int request_registration(const char *user_id) {
         // V1证书格式：证书结构体 + 部分私钥r
         memcpy(&cert, response_data, sizeof(ImpCert));
         memcpy(r, response_data + sizeof(ImpCert), SM2_PRI_MAX_SIZE);
-        printf("已成功接收V1证书和部分私钥r\n");
+        // printf("已成功接收V1证书和部分私钥r\n");
     } 
     else if (response_len == sizeof(ImpCert) + sizeof(ImpCertExt) + SM2_PRI_MAX_SIZE) {
         // V2证书格式：证书结构体 + 扩展信息 + 部分私钥r
@@ -583,7 +612,7 @@ int request_registration(const char *user_id) {
         printf("警告：无法保存用户公钥到文件\n");
     }
     
-    printf("注册过程完成\n");
+    // printf("注册过程完成\n");
     ret = 1;
     
 cleanup:
@@ -772,78 +801,58 @@ cleanup:
     return ret;
 }
 
-int send_signed_message(const char *user_id, const char *message) {
-    // 检查消息长度
-    int message_len = strlen(message);
-    if (message_len > MAX_MESSAGE_SIZE) {
-        printf("消息过长，最大允许%d字节\n", MAX_MESSAGE_SIZE);
+// ----------------- 发送加密消息 -------------------
+int send_encrypt_message(const char *peer_id, const char *server_ip, int port, const char *plaintext) {
+    if (!peer_id || !server_ip || !plaintext) return 0;
+
+    // 获取会话密钥
+    SessionKey *session_key = session_key_get(session_map, peer_id);
+    if (!session_key || !session_key_is_valid(session_key)) {
+        printf("未找到有效会话密钥，请先完成密钥协商\n");
         return 0;
     }
-    
-    // 对消息进行签名
-    unsigned char signature[64];
-    if (!sm2_sign(signature, (const unsigned char *)message, message_len, priv_key)) {
-        printf("签名失败\n");
+    unsigned char iv[SM4_IV_SIZE];
+    sm4_generate_iv(iv);
+    int plaintext_len = strlen(plaintext);
+    int cipher_buf_len = plaintext_len + SM4_BLOCK_SIZE; // 足够存储填充
+    unsigned char *ciphertext = malloc(cipher_buf_len);
+    if (!ciphertext) return 0;
+    int cipher_len = 0;
+    if (!sm4_encrypt(ciphertext, &cipher_len,
+                     (unsigned char*)plaintext, plaintext_len, session_key->key, iv)) {
+        printf("SM4加密失败\n");
+        free(ciphertext);
         return 0;
     }
-    
-    // 计算数据大小，根据证书版本决定
-    int data_size;
-    
-    // 2字节消息长度 + 消息内容 + 64字节签名 + ImpCert基本结构
-    int cert_base_size = sizeof(ImpCert) - sizeof(ImpCertExt*);
-    data_size = 2 + message_len + 64 + cert_base_size;
-    
-    // 如果是V2证书，需要额外添加扩展信息的大小
-    if (loaded_cert.Version == CERT_V2 && loaded_cert.Extensions) {
-        data_size += sizeof(ImpCertExt);
-    }
-    
-    // 分配内存
-    unsigned char *send_data = (unsigned char *)malloc(data_size);
-    if (!send_data) {
-        printf("内存分配失败\n");
-        return 0;
-    }
-    
-    // 填充消息长度（网络字节序）
-    send_data[0] = (message_len >> 8) & 0xFF;  // 高字节
-    send_data[1] = message_len & 0xFF;         // 低字节
-    
-    // 填充消息内容
-    memcpy(send_data + 2, message, message_len);
-    // 填充签名
-    memcpy(send_data + 2 + message_len, signature, 64);
-    
-    // 填充证书基本信息（排除Extensions指针）
-    memcpy(send_data + 2 + message_len + 64, &loaded_cert, cert_base_size);
-    
-    // 如果是V2证书，还需要填充扩展信息
-    if (loaded_cert.Version == CERT_V2 && loaded_cert.Extensions) {
-        memcpy(send_data + 2 + message_len + 64 + cert_base_size, 
-               loaded_cert.Extensions, sizeof(ImpCertExt));
-    }
-    
-    // 使用HTTP发送数据
+
+    // 构造数据包: [4字节ID] [16字节IV] [2字节密文长度] [密文]
+    int packet_size = SUBJECT_ID_LEN + SM4_IV_SIZE + 2 + cipher_len;
+    unsigned char *packet = malloc(packet_size);
+    if (!packet) { free(ciphertext); return 0; }
+    memcpy(packet, user_id, SUBJECT_ID_LEN);
+    memcpy(packet + SUBJECT_ID_LEN, iv, SM4_IV_SIZE);
+    packet[SUBJECT_ID_LEN + SM4_IV_SIZE] = (cipher_len >> 8) & 0xFF;
+    packet[SUBJECT_ID_LEN + SM4_IV_SIZE + 1] = cipher_len & 0xFF;
+    memcpy(packet + SUBJECT_ID_LEN + SM4_IV_SIZE + 2, ciphertext, cipher_len);
+
+    // 构建URL
+    char url[128];
+    sprintf(url, "http://%s:%d/message", server_ip, port);
+
     unsigned char *response_data = NULL;
     int response_len = 0;
-    
-    // 构建URL
-    char url[100];
-    sprintf(url, "http://%s:%d/message", CA_IP, CA_PORT);
-    
-    int result = http_send_request(url, send_data, data_size, &response_data, &response_len);
-    free(send_data);
-    
+    int result = http_send_request(url, packet, packet_size, &response_data, &response_len);
+
+    free(ciphertext);
+    free(packet);
+    if (response_data) free(response_data);
+
     if (result) {
-        printf("已成功发送签名消息\n");
-        if (response_data) free(response_data);
-        return 1;
+        printf("加密消息已发送\n");
     } else {
-        printf("发送签名消息失败\n");
-        if (response_data) free(response_data);
-        return 0;
+        printf("发送失败\n");
     }
+    return result;
 }
 
 // 使用HTTP请求撤销证书
@@ -1128,12 +1137,12 @@ int sync_crl_with_ca() {
     return 1;
 }
 
-// 本地证书状态检查
+// 本地证书状态检查，1表示有效，0表示无效
 int local_csp(const unsigned char *cert_hash) {
     return !check_cert_in_local_crl(cert_hash);
 }
 
-// 证书状态查询函数 - 先尝试在线查询，超时则使用本地查询
+// 证书状态查询函数 - 先尝试在线查询，超时则使用本地查询，1表示有效，0表示无效
 int online_csp(const unsigned char *cert_hash) {
     unsigned char *response_data = NULL;
     int response_len = 0;
@@ -1188,4 +1197,345 @@ int online_csp(const unsigned char *cert_hash) {
     int cert_status = status;
     free(response_data);
     return cert_status;
+}
+
+int request_key_agreement()
+{
+    if (!loaded_cert) {
+        printf("用户证书未加载\n");
+        return -1;
+    }
+    //==================步骤一：用户A构造密钥协商请求 ====================
+    BIGNUM *sA = NULL;
+    EC_POINT *PA = NULL;
+    
+    int ret = 0;
+    sA = BN_new();
+    BN_rand_range(sA, order);
+    
+    // 计算PA=sA·G
+    PA = EC_POINT_new(group);
+    if (!EC_POINT_mul(group, PA, sA, NULL, NULL, NULL)) {
+        printf("计算PA=sA·G失败\n");
+        goto cleanup;
+    }
+    
+    // 将PA转换为字节数组
+    unsigned char PA_bytes[SM2_PUB_MAX_SIZE];
+    int pa_len = EC_POINT_point2oct(group, PA, POINT_CONVERSION_UNCOMPRESSED, 
+                                     PA_bytes, SM2_PUB_MAX_SIZE, NULL);
+    
+    // 生成时间戳T
+    time_t now = time(NULL);
+    uint64_t timestamp = (uint64_t)now;
+    uint64_t ts_network = htobe64(timestamp);  // 转换为网络字节序
+    
+    // 计算数据大小
+    int cert_base_size = sizeof(ImpCert) - sizeof(ImpCertExt*);
+    int ext_size = 0;
+    
+    // 对于V2证书，要包含扩展信息
+    if (loaded_cert->Version == CERT_V2 && loaded_cert->Extensions) {
+        ext_size = sizeof(ImpCertExt);
+    }
+    
+    // 构造认证消息MA={certA,PA,T}
+    int ma_size = cert_base_size + ext_size + pa_len + 8;  // 证书 + 公钥PA + 时间戳
+    unsigned char *ma_data = (unsigned char *)malloc(ma_size);
+    if (!ma_data) {
+        printf("内存分配失败\n");
+        goto cleanup;
+    }
+    
+    // 填充MA数据
+    int offset = 0;
+    // 填充证书基本信息
+    memcpy(ma_data + offset, loaded_cert, cert_base_size);
+    offset += cert_base_size;
+    
+    // 如果是V2证书，填充扩展信息
+    if (loaded_cert->Version == CERT_V2 && loaded_cert->Extensions) {
+        memcpy(ma_data + offset, loaded_cert->Extensions, sizeof(ImpCertExt));
+        offset += sizeof(ImpCertExt);
+    }
+    
+    // 填充PA
+    memcpy(ma_data + offset, PA_bytes, pa_len);
+    offset += pa_len;
+    
+    // 填充时间戳
+    memcpy(ma_data + offset, &ts_network, 8);
+    
+    // 用私钥对MA进行签名
+    unsigned char sig_A[64];
+    if (!sm2_sign(sig_A, ma_data, ma_size, priv_key)) {
+        printf("签名失败\n");
+        free(ma_data);
+        goto cleanup;
+    }
+    
+    // 构造完整的发送数据：MA + 签名
+    int total_size = ma_size + 64;  // MA + 64字节签名
+    unsigned char *send_data = (unsigned char *)malloc(total_size);
+    if (!send_data) {
+        printf("内存分配失败\n");
+        free(ma_data);
+        goto cleanup;
+    }
+    
+    // 复制MA和签名
+    memcpy(send_data, ma_data, ma_size);
+    memcpy(send_data + ma_size, sig_A, 64);
+    free(ma_data);
+    
+    // 使用HTTP发送数据
+    unsigned char *response_data = NULL;
+    int response_len = 0;
+    
+    // 构建URL
+    char url[100];
+    sprintf(url, "http://%s:%d/key_agreement", CA_IP, CA_PORT);
+    if (!http_send_request(url, send_data, total_size, &response_data, &response_len)) {
+        printf("发送密钥协商请求失败\n");
+        free(send_data);
+        goto cleanup;
+    }
+    
+    free(send_data);
+    
+    // ====================步骤二：接收提取{MB,签名,XB}====================
+    EC_POINT *PB = NULL;
+    EC_POINT *PAB = NULL;
+    BIGNUM *xu = NULL;
+    BIGNUM *yu = NULL;
+    BIGNUM *pa_x = NULL;
+    BIGNUM *pa_y = NULL;
+    BIGNUM *pb_x = NULL;
+    BIGNUM *pb_y = NULL;
+    ImpCert *b_cert = NULL;
+    EC_POINT *Pu = NULL;
+    unsigned char Qu[SM2_PUB_MAX_SIZE];
+    unsigned char cert_hash[32];
+    ImpCertExt *cert_ext = NULL;
+    
+    if (response_len <= 0) {
+        printf("密钥协商响应无效\n");
+        goto cleanup;
+    }
+    
+    // 解析响应：MB数据包含：证书 + PB + 时间戳，验证证书的基本结构大小
+    if (response_len < cert_base_size + SM2_PUB_MAX_SIZE + 8 + 64 + 32) {
+        printf("响应数据长度不足\n");
+        goto cleanup;
+    }
+
+    b_cert = (ImpCert *)malloc(sizeof(ImpCert));
+    if (!b_cert) {
+        printf("内存分配失败\n");
+        goto cleanup;
+    }
+    // 解析MB中的证书信息    
+    memcpy(b_cert, response_data, cert_base_size);
+    b_cert->Extensions = NULL;
+    
+    // 确定证书版本和扩展信息偏移量
+    offset = cert_base_size;
+    ext_size = 0;
+    // 对于V2证书，处理扩展信息
+    if (b_cert->Version == CERT_V2) {
+        if (response_len < offset + sizeof(ImpCertExt) + SM2_PUB_MAX_SIZE + 8 + 64 + 32) {
+            printf("响应数据长度不足，无法解析V2证书扩展信息\n");
+            goto cleanup;
+        }
+        
+        cert_ext = (ImpCertExt *)malloc(sizeof(ImpCertExt));
+        if (!cert_ext) {
+            printf("扩展信息内存分配失败\n");
+            goto cleanup;
+        }
+        
+        memcpy(cert_ext, response_data + offset, sizeof(ImpCertExt));
+        b_cert->Extensions = cert_ext;
+        ext_size = sizeof(ImpCertExt);
+        offset += ext_size;
+    }
+    
+    // 提取PB
+    PB = EC_POINT_new(group);
+    if (!PB || !EC_POINT_oct2point(group, PB, response_data + offset, SM2_PUB_MAX_SIZE, NULL)) {
+        printf("解析PB失败\n");
+        goto cleanup;
+    }
+    
+    offset += SM2_PUB_MAX_SIZE;
+    
+    // 提取时间戳
+    uint64_t timestamp_B;
+    memcpy(&timestamp_B, response_data + offset, 8);
+    timestamp_B = be64toh(timestamp_B); // 网络字节序转为主机字节序
+    offset += 8;
+
+    //==================== 步骤三：验证用户B的合法性 ====================
+    // 验证时间戳
+    if (!validate_timestamp(timestamp_B)) {
+        printf("响应中的时间戳无效\n");
+        goto cleanup;
+    }
+    
+    // 验证证书有效性
+    if (!validate_cert(b_cert)) {
+        printf("证书已过期，拒绝密钥协商请求\n");
+        goto cleanup;
+    }
+
+    // 查询证书是否在撤销列表中
+    calc_cert_hash(b_cert, cert_hash);
+    if (online_csp(cert_hash)==0) {
+        printf("证书已被撤销，拒绝密钥协商请求\n");
+        goto cleanup;
+    }
+
+    // 验证签名
+    Pu = EC_POINT_new(group);
+    getPu(b_cert, Pu);
+    // 重构用户公钥 Qu = e*Pu + Q_ca
+    // print_hex("e", cert_hash, 32);
+    unsigned char Pu_bytes[SM2_PUB_MAX_SIZE];
+    EC_POINT_point2oct(group, Pu, POINT_CONVERSION_UNCOMPRESSED, Pu_bytes, SM2_PUB_MAX_SIZE, NULL);
+    // print_hex("Pu", Pu_bytes, SM2_PUB_MAX_SIZE);
+    
+    if(!rec_pubkey(Qu, cert_hash, Pu, Q_ca)) {
+        printf("重构用户公钥失败\n");
+        goto cleanup;
+    }
+    // print_hex("Qu", Qu, SM2_PUB_MAX_SIZE);
+    // 计算MB大小
+    int mb_size = offset;
+    
+    // 提取签名
+    unsigned char sig_B[64];
+    memcpy(sig_B, response_data + mb_size, 64);
+    
+    // 验证签名
+    if (!sm2_verify(sig_B, response_data, mb_size, Qu)) {
+        printf("用户B的签名验证失败\n");
+        goto cleanup;
+    }
+    
+    // 提取XB
+    unsigned char XB[32];
+    memcpy(XB, response_data + mb_size + 64, 32);
+    
+    // 计算共享点PAB = PB·sA
+    PAB = EC_POINT_new(group);
+    if (!PAB || !EC_POINT_mul(group, PAB, NULL, PB, sA, NULL)) {
+        printf("计算共享点PAB=PB·sA失败\n");
+        goto cleanup;
+    }
+    
+    // 提取共享点坐标
+    xu = BN_new();
+    yu = BN_new();
+    if (!xu || !yu || !EC_POINT_get_affine_coordinates(group, PAB, xu, yu, NULL)) {
+        printf("获取共享点坐标失败\n");
+        goto cleanup;
+    }
+    
+    // 将坐标转换为字节数组
+    unsigned char xu_bytes[32] = {0};
+    unsigned char yu_bytes[32] = {0};
+    BN_bn2bin(xu, xu_bytes + (32 - BN_num_bytes(xu)));
+    BN_bn2bin(yu, yu_bytes + (32 - BN_num_bytes(yu)));
+    
+    // 计算SM3(xu)
+    unsigned char sm3_xu[32];
+    sm3_hash(xu_bytes, 32, sm3_xu);
+    
+    // 提取PA和PB的坐标
+    unsigned char PA_x_bytes[32] = {0};
+    unsigned char PA_y_bytes[32] = {0};
+    unsigned char PB_x_bytes[32] = {0};
+    unsigned char PB_y_bytes[32] = {0};
+    
+    // 提取PA的坐标
+    pa_x = BN_new();
+    pa_y = BN_new();
+    if (!pa_x || !pa_y || !EC_POINT_get_affine_coordinates(group, PA, pa_x, pa_y, NULL)) {
+        printf("获取PA坐标失败\n");
+        goto cleanup;
+    }
+    BN_bn2bin(pa_x, PA_x_bytes + (32 - BN_num_bytes(pa_x)));
+    BN_bn2bin(pa_y, PA_y_bytes + (32 - BN_num_bytes(pa_y)));
+    
+    // 提取PB的坐标
+    pb_x = BN_new();
+    pb_y = BN_new();
+    if (!pb_x || !pb_y || !EC_POINT_get_affine_coordinates(group, PB, pb_x, pb_y, NULL)) {
+        printf("获取PB坐标失败\n");
+        goto cleanup;
+    }
+    BN_bn2bin(pb_x, PB_x_bytes + (32 - BN_num_bytes(pb_x)));
+    BN_bn2bin(pb_y, PB_y_bytes + (32 - BN_num_bytes(pb_y)));
+    
+    // 验证XB
+    // 构造XB计算数据：XB=SM3(0x02||yu||SM3(xu)||PAx||PAy||PBx||PBy)
+    unsigned char xb_data[1 + 32 + 32 + 32*4];
+    xb_data[0] = 0x02;
+    memcpy(xb_data + 1, yu_bytes, 32);
+    memcpy(xb_data + 1 + 32, sm3_xu, 32);
+    memcpy(xb_data + 1 + 32 + 32, PA_x_bytes, 32);
+    memcpy(xb_data + 1 + 32 + 32 + 32, PA_y_bytes, 32);
+    memcpy(xb_data + 1 + 32 + 32 + 32 + 32, PB_x_bytes, 32);
+    memcpy(xb_data + 1 + 32 + 32 + 32 + 32 + 32, PB_y_bytes, 32);
+    
+    // 重新计算XB并验证
+    unsigned char calc_XB[32];
+    sm3_hash(xb_data, sizeof(xb_data), calc_XB);
+    
+    // 比较计算出的XB与接收到的XB
+    if (memcmp(XB, calc_XB, 32) != 0) {
+        printf("密钥确认值XB验证失败\n");
+        goto cleanup;
+    }
+    
+    // printf("密钥确认值XB验证成功\n");
+
+    /* --------- 生成并保存会话密钥 --------- */
+    {
+        unsigned char Z[32 + 32 + 4 + 4];
+        memcpy(Z, xu_bytes, 32);
+        memcpy(Z + 32, yu_bytes, 32);
+        memcpy(Z + 64, loaded_cert->SubjectID, 4);         /* ID_A */
+        memcpy(Z + 68, b_cert->IssuerID, 4);               /* ID_B = CA ID */
+        unsigned char sess_key[SESSION_KEY_LEN];
+        if (!sm3_kdf(Z, sizeof(Z), sess_key, SESSION_KEY_LEN)) {
+            printf("SM3 KDF失败\n");
+            goto cleanup;
+        }
+        char id_str[5];
+        memcpy(id_str, b_cert->SubjectID, 4);
+        id_str[4] = '\0';
+        session_key_put(session_map, id_str, sess_key);
+        SessionKey *t_key = session_key_get(session_map, id_str);
+        printf("和%s的会话密钥为：", id_str);
+        if (t_key) print_hex("key", t_key->key, SESSION_KEY_LEN);
+        ret = 1;
+    }
+    
+cleanup:
+    if (sA) BN_free(sA);
+    if (PA) EC_POINT_free(PA);
+    if (PB) EC_POINT_free(PB);
+    if (PAB) EC_POINT_free(PAB);
+    if (xu) BN_free(xu);
+    if (yu) BN_free(yu);
+    if (pa_x) BN_free(pa_x);
+    if (pa_y) BN_free(pa_y);
+    if (pb_x) BN_free(pb_x);
+    if (pb_y) BN_free(pb_y);
+    if (Pu) EC_POINT_free(Pu);
+    if (b_cert) free_cert(b_cert);
+    if (response_data) free(response_data);
+    
+    return ret;
 }

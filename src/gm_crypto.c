@@ -5,10 +5,44 @@
 #include <openssl/param_build.h>
 #include <openssl/bn.h>
 #include <openssl/evp.h>
+#include <openssl/rand.h>
 #include <stdio.h>
 #include <string.h>
 
+// 全局参数
+EC_GROUP *group = NULL;
+BIGNUM *order = NULL;
+
 /* SM2相关函数实现 */
+int global_params_init() {
+    // 创建SM2椭圆曲线组
+    group = EC_GROUP_new_by_curve_name(1172);
+    if (!group) {
+        printf("初始化SM2曲线参数失败！\n");
+        return 0;
+    }
+    
+    order = BN_new();
+    if (!order || !EC_GROUP_get_order(group, order, NULL)) {
+        printf("获取SM2曲线阶失败！\n");
+        global_params_cleanup();
+        return 0;
+    }
+    
+    return 1;
+}
+
+void global_params_cleanup() {
+    if (order) {
+        BN_free(order);
+        order = NULL;
+    }
+    
+    if (group) {
+        EC_GROUP_free(group);
+        group = NULL;
+    }
+}
 
 /**
  * SM2签名结构体定义
@@ -223,7 +257,7 @@ static int rs_to_asn1(unsigned char *out, size_t *out_len, const unsigned char *
  * 
  * 说明：将ASN.1编码的SM2签名转换为RS格式，即签名值r和s的连接
  */
-int sm2_sig_to_rs(unsigned char *out, const unsigned char *in, int in_len)
+static int sm2_sig_to_rs(unsigned char *out, const unsigned char *in, int in_len)
 {
     if (!out || !in)
         return 0;
@@ -240,17 +274,6 @@ int sm2_sig_to_rs(unsigned char *out, const unsigned char *in, int in_len)
     return success;
 }
 
-/**
- * 生成SM2密钥对
-* 
- * @param pub [out] 输出缓冲区，用于存储生成的公钥
- * @param pub_len [out] 输出公钥的长度
- * @param pri [out] 输出缓冲区，用于存储生成的私钥
- * @param pri_len [out] 输出私钥的长度
- * @return 成功返回1，失败返回0
- * 
- * 说明：生成一对新的SM2公私钥对
- */
 int sm2_key_pair_new(unsigned char *pub, unsigned char *pri)
 {
     // 生成SM2密钥对
@@ -296,15 +319,6 @@ cleanup:
 }
 
 
-/**
- * SM2签名操作(一次性完成)，产生R||S格式的签名
-* 
- * @param sig [out] 输出缓冲区，用于存储生成的签名，必须至少有64字节
- * @param in [in] 要签名的数据
- * @param in_len [in] 要签名的数据长度
- * @param pri [in] 私钥数据，必须是SM2_PRI_MAX_SIZE字节
- * @return 成功返回1，失败返回0
- */
 int sm2_sign(unsigned char *sig, const unsigned char *in, size_t in_len, const unsigned char *pri)
 {
     if (!sig || !in || !pri)
@@ -356,15 +370,7 @@ int sm2_sign(unsigned char *sig, const unsigned char *in, size_t in_len, const u
     return success;
 }
 
-/**
- * SM2签名验证操作(一次性完成)，验证R||S格式的签名
-* 
- * @param sig [in] 要验证的R||S格式签名数据，必须是64字节
- * @param in [in] 原始数据
- * @param in_len [in] 原始数据长度
- * @param pub [in] 公钥数据
- * @return 验证成功返回1，失败返回0
- */
+
 int sm2_verify(const unsigned char *sig, const unsigned char *in, size_t in_len, const unsigned char *pub)
 {
     if (!sig || !in || !pub)
@@ -414,119 +420,147 @@ int sm2_verify(const unsigned char *sig, const unsigned char *in, size_t in_len,
     return ret;
 }
 
+/* =============== SM3相关函数实现 ============== */
 
 
-
-
-
-
-/* SM3相关函数实现 */
-
-/**
- * @brief 创建并初始化一个新的SM3上下文
- * 
- * 该函数完成以下操作：
- * 1. 创建一个新的EVP_MD_CTX上下文
- * 2. 使用SM3算法初始化该上下文
- * 
- * @return EVP_MD_CTX* 成功返回初始化好的上下文指针，失败返回NULL
- */
-EVP_MD_CTX *sm3_md_ctx_new()
-{
-    EVP_MD_CTX *ctx = NULL;
-    int success =
-        (ctx = EVP_MD_CTX_new()) &&    /* 创建新的消息摘要上下文 */
-        EVP_DigestInit(ctx, EVP_sm3()); /* 使用SM3算法初始化上下文 */
-    
-    /* 如果创建或初始化失败，释放资源并返回NULL */
-    if (!success)
-    {
-        sm3_md_ctx_free(ctx);
-        ctx = NULL;
-    }
-    return ctx;
-}
-
-/**
- * @brief 释放SM3上下文资源
- * 
- * 安全地释放上下文资源，并将指针置为NULL
- * 
- * @param ctx [in] 要释放的上下文指针
- */
-void sm3_md_ctx_free(EVP_MD_CTX *ctx)
-{
-    if (ctx)
-    {
-        EVP_MD_CTX_free(ctx);
-        ctx = NULL;
-    }
-}
-
-/**
- * @brief 向SM3上下文中更新数据
- * 
- * 将新的数据块添加到哈希计算中
- * 
- * @param ctx [in,out] SM3上下文
- * @param in [in] 输入数据
- * @param in_len [in] 输入数据长度
- * @return int 成功返回1，失败返回0
- */
-int sm3_md_update(EVP_MD_CTX *ctx, const unsigned char *in, size_t in_len)
-{
-    /* 验证参数有效性并更新哈希计算 */
-    return ctx && in &&
-           EVP_DigestUpdate(ctx, in, in_len);
-}
-
-/**
- * @brief 完成SM3哈希计算并输出结果
- * 
- * @param ctx [in] SM3上下文
- * @param md [out] 输出的哈希值缓冲区
- * @param md_len [out] 输出的哈希值长度
- * @return int 成功返回1，失败返回0
- */
-int sm3_md_final(EVP_MD_CTX *ctx, unsigned char *md, unsigned int *md_len)
-{
-    /* 验证参数有效性并完成哈希计算 */
-    return ctx && md && md_len &&
-           EVP_DigestFinal(ctx, md, md_len);
-}
-
-/**
- * @brief 计算输入数据的SM3哈希值
- * 
- * 这是一个便捷函数，它完成完整的哈希计算过程：
- * 1. 创建并初始化上下文
- * 2. 更新数据
- * 3. 完成计算并输出结果
- * 4. 释放资源
- * 
- * @param in [in] 输入数据
- * @param in_len [in] 输入数据长度
- * @param md [out] 输出的哈希值缓冲区，长度应至少为SM3_MD_SIZE(32字节)
- * @return int 成功返回1，失败返回0
- */
 int sm3_hash(const unsigned char *in, size_t in_len, unsigned char *md)
 {
-    /* 参数有效性检查 */
-    if (!md || !in)
+    if (!in || !md)
+    {
+        return 0;
+    }
+
+    EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+    if (!ctx)
+    {
+        return 0;
+    }
+
+    int ret = 0;
+    unsigned int md_len = 0;
+
+    do
+    {
+        if (!EVP_DigestInit_ex(ctx, EVP_sm3(), NULL))
+        {
+            break;
+        }
+
+        if (!EVP_DigestUpdate(ctx, in, in_len))
+        {
+            break;
+        }
+
+        if (!EVP_DigestFinal_ex(ctx, md, &md_len))
+        {
+            break;
+        }
+
+        ret = 1;
+    } while (0);
+
+    EVP_MD_CTX_free(ctx);
+
+    return ret;
+}
+
+int sm3_kdf(const unsigned char *in, size_t in_len, unsigned char *out, size_t out_len)
+{
+    if (!in || !out || out_len == 0 || out_len > SM3_MD_SIZE)
         return 0;
 
-    EVP_MD_CTX *ctx = NULL;
-    unsigned int md_len; // 内部处理哈希长度
-    int success =
-        (ctx = sm3_md_ctx_new()) &&               /* 创建并初始化上下文 */
-        sm3_md_update(ctx, in, in_len) &&         /* 更新数据 */
-        sm3_md_final(ctx, md, &md_len);           /* 完成计算并输出结果 */
+    unsigned char digest[SM3_MD_SIZE];
+    unsigned char *buf = NULL;
+    size_t buf_len = in_len + 4; // Z || ct
 
-    /* 释放资源 */
-    if (ctx)
-    {
-        sm3_md_ctx_free(ctx);
-        ctx = NULL;
+    buf = (unsigned char *)malloc(buf_len);
+    if (!buf) return 0;
+
+    memcpy(buf, in, in_len);
+    // ct = 0x00000001 (big-endian)
+    buf[in_len]     = 0x00;
+    buf[in_len + 1] = 0x00;
+    buf[in_len + 2] = 0x00;
+    buf[in_len + 3] = 0x01;
+
+    int ret = sm3_hash(buf, buf_len, digest);
+    free(buf);
+    if (!ret) return 0;
+
+    memcpy(out, digest, out_len);
+    return 1;
+}
+
+/* =====================================================================
+ * SM4 相关函数实现
+ * ===================================================================== */
+
+int sm4_generate_key(unsigned char *key)
+{
+    if (!key) return 0;
+    return RAND_bytes(key, SM4_KEY_SIZE);
+}
+
+int sm4_generate_iv(unsigned char *iv)
+{
+    if (!iv) return 0;
+    return RAND_bytes(iv, SM4_IV_SIZE);
+}
+
+int sm4_encrypt(unsigned char *out, int *out_len,
+                const unsigned char *in, int in_len,
+                const unsigned char *key, const unsigned char *iv)
+{
+    if (!out || !out_len || !in || !key || !iv) return 0;
+
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) return 0;
+
+    int len = 0, total_len = 0;
+    int success = 0;
+
+    if (EVP_EncryptInit_ex(ctx, EVP_sm4_cbc(), NULL, key, iv) == 1) {
+        EVP_CIPHER_CTX_set_padding(ctx, 1);
+
+        if (EVP_EncryptUpdate(ctx, out, &len, in, in_len) == 1) {
+            total_len = len;
+            if (EVP_EncryptFinal_ex(ctx, out + len, &len) == 1) {
+                total_len += len;
+                *out_len = total_len;
+                success = 1;
+            }
+        }
     }
+
+    EVP_CIPHER_CTX_free(ctx);
     return success;
-} 
+}
+
+int sm4_decrypt(unsigned char *out, int *out_len,
+                const unsigned char *in, int in_len,
+                const unsigned char *key, const unsigned char *iv)
+{
+    if (!out || !out_len || !in || !key || !iv) return 0;
+
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) return 0;
+
+    int len = 0, total_len = 0;
+    int success = 0;
+
+    if (EVP_DecryptInit_ex(ctx, EVP_sm4_cbc(), NULL, key, iv) == 1) {
+        EVP_CIPHER_CTX_set_padding(ctx, 1);
+
+        if (EVP_DecryptUpdate(ctx, out, &len, in, in_len) == 1) {
+            total_len = len;
+            if (EVP_DecryptFinal_ex(ctx, out + len, &len) == 1) {
+                total_len += len;
+                *out_len = total_len;
+                success = 1;
+            }
+        }
+    }
+
+    EVP_CIPHER_CTX_free(ctx);
+    return success;
+}

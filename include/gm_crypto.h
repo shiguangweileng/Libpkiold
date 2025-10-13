@@ -1,10 +1,24 @@
 #ifndef GM_CRYPTO_H
 #define GM_CRYPTO_H
 
-#include "common.h"
 #include <openssl/evp.h>
+#include <openssl/ec.h>
+#include <openssl/bn.h>
+#define EXPORT __attribute__((visibility("default")))
 
-/* SM2相关定义 */
+/* ===============SM2相关定义============== */
+// SM2全局参数
+extern EC_GROUP *group;
+extern BIGNUM *order;
+
+//SM2算法相关参数定义
+#define SM2_PUB_MAX_SIZE 65   // SM2公钥最大长度(字节)：0x04 || x || y
+#define SM2_PRI_MAX_SIZE 32   // SM2私钥最大长度(字节)
+#define SM2_SIG_MAX_SIZE 72   // SM2签名最大长度(字节)：DER编码的r和s
+
+// SM2参数初始化和释放
+EXPORT int global_params_init();
+EXPORT void global_params_cleanup();
 
 typedef struct sm2_sig_ctx_st
 {
@@ -13,19 +27,6 @@ typedef struct sm2_sig_ctx_st
     EVP_PKEY_CTX *pctx;  // 密钥操作上下文
     EVP_MD_CTX *mctx;    // 消息摘要上下文
 } SM2_SIG_CTX;
-
-/**
- * @brief 将SM2签名从ASN.1格式转换为RS格式
- * 
- * @param out [out] 输出缓冲区，用于存储转换后的签名
- * @param out_len [out] 输出签名的长度
- * @param in [in] 输入的ASN.1格式签名
- * @param in_len [in] 输入签名的长度
- * @return int 成功返回1，失败返回0
- * 
- * @note RS格式为：r || s，直接拼接签名的r和s值
- */
-EXPORT int sm2_sig_to_rs(unsigned char *out, const unsigned char *in, int in_len);
 
 /**
  * @brief 生成SM2密钥对
@@ -64,8 +65,26 @@ EXPORT int sm2_sign(unsigned char *sig, const unsigned char *in, size_t in_len, 
  */
 EXPORT int sm2_verify(const unsigned char *sig, const unsigned char *in, size_t in_len, const unsigned char *pub);
 
-/* SM3相关定义 */
+/* ===============SM4相关定义============== */
 
+#define SM4_KEY_SIZE 16      // 128位密钥
+#define SM4_IV_SIZE 16       // 128位IV
+#define SM4_BLOCK_SIZE 16    // 128位块大小
+
+/* SM4 密钥和IV生成 */
+EXPORT int sm4_generate_key(unsigned char *key);
+EXPORT int sm4_generate_iv(unsigned char *iv);
+
+/* SM4 CBC模式加解密 */
+EXPORT int sm4_encrypt(unsigned char *out, int *out_len,
+                       const unsigned char *in, int in_len,
+                       const unsigned char *key, const unsigned char *iv);
+EXPORT int sm4_decrypt(unsigned char *out, int *out_len,
+                       const unsigned char *in, int in_len,
+                       const unsigned char *key, const unsigned char *iv);
+
+
+/* ===============SM3相关定义============== */
 #define SM3_MD_SIZE 32
 
 /**
@@ -78,33 +97,14 @@ EXPORT int sm2_verify(const unsigned char *sig, const unsigned char *in, size_t 
 EXPORT int sm3_hash(const unsigned char *in, size_t in_len, unsigned char *md);
 
 /**
- * @brief 创建并初始化一个新的SM3上下文
- * @return EVP_MD_CTX* 成功返回上下文指针，失败返回NULL
- */
-EXPORT EVP_MD_CTX *sm3_md_ctx_new();
-
-/**
- * @brief 释放SM3上下文资源
- * @param ctx [in] 要释放的上下文指针
- */
-EXPORT void sm3_md_ctx_free(EVP_MD_CTX *ctx);
-
-/**
- * @brief 向SM3上下文中更新数据
- * @param ctx [in,out] SM3上下文
+ * @brief 基于SM3的KDF(Key Derivation Function)
  * @param in [in] 输入数据
  * @param in_len [in] 输入数据长度
+ * @param out [out] 输出密钥缓冲区
+ * @param out_len [in] 期望输出密钥长度，<=32
  * @return int 成功返回1，失败返回0
  */
-EXPORT int sm3_md_update(EVP_MD_CTX *ctx, const unsigned char *in, size_t in_len);
+EXPORT int sm3_kdf(const unsigned char *in, size_t in_len, unsigned char *out, size_t out_len);
 
-/**
- * @brief 完成SM3哈希计算并输出结果
- * @param ctx [in] SM3上下文
- * @param md [out] 输出的哈希值缓冲区
- * @param md_len [out] 输出的哈希值长度
- * @return int 成功返回1，失败返回0
- */
-EXPORT int sm3_md_final(EVP_MD_CTX *ctx, unsigned char *md, unsigned int *md_len);
 
-#endif 
+#endif

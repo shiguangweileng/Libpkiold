@@ -95,7 +95,7 @@ int set_cert(ImpCert *cert,
         (version == CERT_V2 && extensions == NULL)) {
         return 0;
     }
-    
+    memset(cert, 0, sizeof(ImpCert));
     // 设置证书版本
     cert->Version = version;
     
@@ -482,23 +482,22 @@ int calc_cert_hash(const ImpCert *cert, unsigned char *hash_out) {
     }
 
     if (cert->Version == CERT_V1 || cert->Extensions == NULL) {
-        // V1证书或没有扩展信息的情况，直接计算证书结构体的哈希
-        sm3_hash((const unsigned char *)cert, sizeof(ImpCert), hash_out);
+        /* V1证书：只计算纯字段数据，不包含任何填充 */
+        unsigned char buf[75];  // 纯字段数据大小
+        memset(buf, 0, 75);
+        memcpy(buf, cert, 75);  // 直接复制前75字节的有效数据
+        sm3_hash(buf, 75, hash_out);
         return 1;
     }
     else if (cert->Version == CERT_V2) {
-        // 证书基本信息长度（不包含Extensions指针）
-        size_t base_len = sizeof(ImpCert) - sizeof(ImpCertExt*);
-        unsigned char temp_buffer[base_len + sizeof(ImpCertExt)];
-        
-        // 复制ImpCert结构体中除Extensions指针外的所有字段
-        memcpy(temp_buffer, cert, base_len);
-        
-        // 将扩展数据内容复制到临时缓冲区的后半部分
-        memcpy(temp_buffer + base_len, cert->Extensions, sizeof(ImpCertExt));
-        
-        // 计算组合数据的哈希
-        sm3_hash(temp_buffer, base_len + sizeof(ImpCertExt), hash_out);
+        /* V2证书：基本字段数据(75字节) + 扩展信息(14字节) */
+        const size_t total_len = 75 + sizeof(ImpCertExt);  // 75 + 14 = 89字节
+
+        unsigned char buf[total_len];
+        memset(buf, 0, total_len);
+        memcpy(buf, cert, 75);  // 复制前75字节的基本字段数据
+        memcpy(buf + 75, cert->Extensions, sizeof(ImpCertExt));  // 复制扩展信息
+        sm3_hash(buf, total_len, hash_out);
         return 1;
     }
     return 0;

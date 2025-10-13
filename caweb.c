@@ -95,7 +95,7 @@ int main() {
     pthread_t ca_thread;
     
     // 初始化SM2参数
-    if (!sm2_params_init()) {
+    if (!global_params_init()) {
         fprintf(stderr, "初始化SM2参数失败\n");
         return 1;
     }
@@ -159,7 +159,7 @@ int main() {
     }
     pthread_mutex_unlock(&crl_mutex);
     
-    sm2_params_cleanup();
+    global_params_cleanup();
     
     return 0;
 }
@@ -787,7 +787,6 @@ int handle_sign_message(struct MHD_Connection *connection, const char *upload_da
         return send_json_error(connection, MHD_HTTP_BAD_REQUEST, "缺少必要的请求参数");
     }
     
-    const char *user_id = json_object_get_string(user_id_obj);
     const char *private_key_hex = json_object_get_string(private_key_obj);
     const char *message = json_object_get_string(message_obj);
     
