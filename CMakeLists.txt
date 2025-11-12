@@ -112,3 +112,18 @@ target_link_libraries(caweb
 set_target_properties(caweb PROPERTIES
   OUTPUT_NAME caweb
   RUNTIME_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR})
+
+# ----------------------------------------------------------------------------
+# 可执行文件: cert_parser
+# ----------------------------------------------------------------------------
+add_executable(cert_parser cert_parser.c)
+
+target_link_libraries(cert_parser
+  PRIVATE
+    libpki
+    OpenSSL::Crypto
+)
+
+set_target_properties(cert_parser PROPERTIES
+  OUTPUT_NAME cert_parser
+  RUNTIME_OUTPUT_DIRECTORY ${PROJECT_SOURCE_DIR})

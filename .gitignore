@@ -4,11 +4,13 @@ caweb
 zlog_test
 std-test
 admin
+cert_parser
 
 # 用户数据
 U*.crt
 U*_priv.key
 U*_pub.key
+U*.bin
 
 # ca数据
 CRL.dat
